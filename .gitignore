@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+config.local.*
+secrets.*
+agent.md
+
+# Runtime binding data and logs
+binds.json
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-*
+data/
+runtime/
+logs/
+*.log
