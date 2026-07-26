@@ -1,0 +1,18 @@
+gensokyo:
+  last_verified_release: "009"
+  verified_at: "2026-07-25T14:29:00Z"
+  baseline_commit: "2bad066f72235f2d067b9d82b47a8ed8e867efc9"
+  verification:
+    status: partial
+    evidence: ["tests/test_qbind.py"]
+  modes:
+    string_message: false
+    array_message: false
+    use_uin_true: false
+    use_uin_false: false
+    markdown: false
+    keyboard: false
+  automated_tested: false
+  live_tested: false
+  known_issues:
+    - "Release009 shared fixtures pass; repository-specific integration is pending."

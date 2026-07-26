@@ -7,10 +7,13 @@ import json
 import nonebot
 nonebot.init()
 
-import src.plugins.amia_core as core
+from standalone_loader import load_core, load_qbind
+
+core = load_core()
 _real_require = nonebot.require
 nonebot.require = lambda name: core if name == "amia_core" else _real_require(name)
 
+load_qbind()
 from src.plugins.amia_core.identity import UserIdentityKey
 from src.plugins.qbind import _binds, _BINDS_FILE, _save_binds, is_bound, get_real_qq
 from src.plugins.qbind.identity import QbindIdentityResolver
