@@ -46,3 +46,7 @@ python -m unittest discover -s tests -v
 ## 维护边界
 
 不在本插件中实现 Economy、Send、Profile 或其他业务逻辑，也不建立第二套账号绑定系统。
+
+## Release010 发布说明
+
+Release010 继续以 `self_id + user_id` 字符串组合作为外部身份，不把 OpenID 强制转换为数字 QQ。测试加载器已改为当前 `src/plugins` 目录结构；`binds.json`、数据库、配置、日志和真实绑定记录始终属于运行数据，不会上传。

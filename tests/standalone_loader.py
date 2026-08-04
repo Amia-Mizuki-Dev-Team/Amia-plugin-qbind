@@ -22,7 +22,7 @@ def load_core():
     if "src.plugins.amia_core" in sys.modules:
         return sys.modules["src.plugins.amia_core"]
 
-    root = Path(__file__).resolve().parents[2] / "amia-core"
+    root = Path(__file__).resolve().parents[2] / "amia_core"
     if not (root / "__init__.py").is_file():
         raise ModuleNotFoundError("sibling isolated amia-core was not found")
     _install_namespace(root)
@@ -44,7 +44,7 @@ def load_qbind():
         return sys.modules["src.plugins.qbind"]
 
     root = Path(__file__).resolve().parents[1]
-    core_root = Path(__file__).resolve().parents[2] / "amia-core"
+    core_root = Path(__file__).resolve().parents[2] / "amia_core"
     _install_namespace(core_root)
     spec = importlib.util.spec_from_file_location(
         "src.plugins.qbind",

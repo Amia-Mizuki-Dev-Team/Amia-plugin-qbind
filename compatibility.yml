@@ -1,18 +1,19 @@
 gensokyo:
-  last_verified_release: "009"
-  verified_at: "2026-07-25T14:29:00Z"
-  baseline_commit: "2bad066f72235f2d067b9d82b47a8ed8e867efc9"
+  last_verified_release: "010"
+  verified_at: "2026-08-01"
+  baseline_commit: "9151721c1dad015df37387b06edf3c18fd0936f3"
   verification:
     status: partial
     evidence: ["tests/test_qbind.py"]
   modes:
-    string_message: false
-    array_message: false
-    use_uin_true: false
-    use_uin_false: false
-    markdown: false
-    keyboard: false
-  automated_tested: false
+    string_message: {status: automated, evidence: ["tests/test_qbind.py"]}
+    array_message: {status: automated, evidence: ["tests/test_qbind.py"]}
+    use_uin_true: {status: unverified, evidence: []}
+    use_uin_false: {status: unverified, evidence: []}
+    markdown: {status: unverified, evidence: []}
+    keyboard: {status: unverified, evidence: []}
+    file_segment: {status: unverified, evidence: []}
+  automated_tested: true
   live_tested: false
   known_issues:
-    - "Release009 shared fixtures pass; repository-specific integration is pending."
+    - "Release010 automated/shared fixtures are partial; repository-specific and live integration remain unverified."
