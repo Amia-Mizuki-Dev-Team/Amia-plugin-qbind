@@ -50,3 +50,7 @@ python -m unittest discover -s tests -v
 ## Release010 发布说明
 
 Release010 继续以 `self_id + user_id` 字符串组合作为外部身份，不把 OpenID 强制转换为数字 QQ。测试加载器已改为当前 `src/plugins` 目录结构；`binds.json`、数据库、配置、日志和真实绑定记录始终属于运行数据，不会上传。
+
+## 代码核验与十月状态（2026-10-14）
+
+QBind 负责外部会话身份到 canonical QQ 身份的映射；`identity.py` 中 `QbindIdentityResolver` 向 `amia-core` 输出 `ResolvedIdentity`。未绑定身份不能凭昵称推断真实账号，运行时绑定数据不得加入 Git。2026-10-01 至 2026-10-14 默认分支未发现新提交。
