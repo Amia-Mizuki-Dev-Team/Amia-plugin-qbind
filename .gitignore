@@ -15,6 +15,7 @@ agent.md
 
 # Runtime binding data and logs
 binds.json
+binds.json.migration-*.bak
 *.db
 *.sqlite
 *.sqlite3

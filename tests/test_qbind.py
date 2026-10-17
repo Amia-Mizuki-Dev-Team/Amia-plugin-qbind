@@ -1,59 +1,196 @@
-import unittest
 import asyncio
-import tempfile
-import os
 import json
+import tempfile
+import unittest
+from dataclasses import replace
+from pathlib import Path
 
 import nonebot
+
 nonebot.init()
 
 from standalone_loader import load_core, load_qbind
 
+
 core = load_core()
 _real_require = nonebot.require
 nonebot.require = lambda name: core if name == "amia_core" else _real_require(name)
+qbind = load_qbind()
 
-load_qbind()
 from src.plugins.amia_core.identity import UserIdentityKey
-from src.plugins.qbind import _binds, _BINDS_FILE, _save_binds, is_bound, get_real_qq
-from src.plugins.qbind.identity import QbindIdentityResolver
+from src.plugins.qbind.mail import QbindEmailService
+
+
+# The historical storage/adapter tests exercise the pre-email declaration
+# contract directly.  New email-specific tests inject a required service; all
+# other tests use this explicit legacy-mode service instead of inheriting the
+# developer's local .env setting.
+qbind.set_email_service(
+    QbindEmailService(replace(qbind._email_service.config, required=False))
+)
+
 
 class TestQbind(unittest.TestCase):
     def setUp(self):
-        # Backup binds file and clean memory bindings
-        self.old_binds = _binds.copy()
-        _binds.clear()
+        self.temporary = tempfile.TemporaryDirectory(prefix="qbind-test-")
+        self.db_path = Path(self.temporary.name) / "qbind.sqlite3"
+        self.legacy_path = Path(self.temporary.name) / "binds.json"
+        qbind.configure_storage(self.db_path, self.legacy_path)
 
     def tearDown(self):
-        # Restore memory bindings
-        _binds.clear()
-        _binds.update(self.old_binds)
+        self.temporary.cleanup()
 
-    def test_binding_queries(self):
-        # Test unbound
-        self.assertFalse(is_bound("virtual_user_1"))
-        self.assertIsNone(get_real_qq("virtual_user_1"))
+    def test_declaration_is_not_canonical_until_trusted_verification(self):
+        qbind.get_store().declare_personal(
+            bot_scope="bot-a",
+            external_user_id="virtual-user-1",
+            canonical_user_id="1234567",
+            bound_by_user_id="virtual-user-1",
+            verification_source="test:type5",
+        )
 
-        # Add bind
-        _binds["virtual_user_1"] = "1234567"
-        _binds["1234567"] = "1234567"
+        self.assertEqual(
+            qbind.get_real_qq("virtual-user-1", "bot-a"), "1234567"
+        )
+        self.assertIsNone(qbind.get_verified_qq("virtual-user-1", "bot-a"))
+        self.assertEqual(qbind.get_binding_status("virtual-user-1", "bot-a"), "declared")
 
-        # Test bound
-        self.assertTrue(is_bound("virtual_user_1"))
-        self.assertEqual(get_real_qq("virtual_user_1"), "1234567")
+        resolver = qbind.QbindIdentityResolver()
+        key = UserIdentityKey(self_id="bot-a", user_id="virtual-user-1")
+        unresolved = asyncio.run(resolver.resolve_identity(key))
+        self.assertIsNone(unresolved.canonical_user_id)
 
-        # Test identity resolver
-        resolver = QbindIdentityResolver()
-        key = UserIdentityKey(self_id="test-bot", user_id="virtual_user_1")
+        qbind.approve_personal_binding(
+            self_id="bot-a",
+            user_id="virtual-user-1",
+            verified_by="trusted-admin",
+            verification_source="test:review",
+        )
         resolved = asyncio.run(resolver.resolve_identity(key))
         self.assertEqual(resolved.canonical_user_id, "1234567")
-        self.assertEqual(resolved.opaque_id, "1234567")
+        self.assertEqual(
+            asyncio.run(resolver.resolve_user_identity(key)).verification_status,
+            "verified",
+        )
 
-        # Test unbound key
-        key_unbound = UserIdentityKey(self_id="test-bot", user_id="virtual_user_not_bound")
-        resolved_unbound = asyncio.run(resolver.resolve_identity(key_unbound))
-        self.assertIsNone(resolved_unbound.canonical_user_id)
-        self.assertEqual(resolved_unbound.opaque_id, "unbound:test-bot:virtual_user_not_bound")
+    def test_bot_scope_is_never_inferred_by_global_scan(self):
+        qbind.get_store().declare_personal(
+            bot_scope="bot-a",
+            external_user_id="same-virtual-id",
+            canonical_user_id="1234567",
+            bound_by_user_id="same-virtual-id",
+            verification_source="test",
+        )
+        self.assertEqual(qbind.get_real_qq("same-virtual-id", "bot-a"), "1234567")
+        self.assertIsNone(qbind.get_real_qq("same-virtual-id", "bot-b"))
+        self.assertEqual(qbind.get_binding_status("same-virtual-id", "bot-b"), "unbound")
+
+    def test_legacy_json_is_migrated_as_declared_and_backed_up(self):
+        self.legacy_path.write_text(
+            json.dumps(
+                {
+                    "virtual-user-1": "1234567",
+                    "1234567": "1234567",
+                }
+            ),
+            encoding="utf-8",
+        )
+        qbind.configure_storage(self.db_path, self.legacy_path)
+        record = qbind.get_store().get_personal("legacy", "virtual-user-1")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.binding_status, "declared")
+        self.assertIsNone(qbind.get_real_qq("virtual-user-1", "legacy", verified_only=True))
+        self.assertTrue(list(self.legacy_path.parent.glob("binds.json.migration-*.bak")))
+
+    def test_context_resolution_keeps_group_and_user_status_separate(self):
+        qbind.get_store().declare_personal(
+            bot_scope="bot-a",
+            external_user_id="user-1",
+            canonical_user_id="1234567",
+            bound_by_user_id="user-1",
+            verification_source="test",
+        )
+        qbind.approve_personal_binding(
+            self_id="bot-a",
+            user_id="user-1",
+            verified_by="trusted-admin",
+            verification_source="test:review",
+        )
+        qbind.get_store().set_group_pending(
+            bot_scope="bot-a",
+            virtual_group_id="virtual-group-1",
+            real_group_id="9876543",
+            group_name="Test",
+            bound_by_user_id="user-1",
+            verification_source="test:manual",
+        )
+        context = asyncio.run(
+            qbind.resolve_context_identity(
+                self_id="bot-a", user_id="user-1", group_id="virtual-group-1"
+            )
+        )
+        self.assertEqual(context["canonical_user_id"], "1234567")
+        self.assertEqual(context["user_verification_status"], "verified")
+        self.assertIsNone(context["canonical_group_id"])
+        self.assertEqual(context["group_verification_status"], "pending_verification")
+
+    def test_membership_archive_requires_both_verified_bindings(self):
+        store = qbind.get_store()
+        store.declare_personal(
+            bot_scope="bot-a",
+            external_user_id="user-1",
+            canonical_user_id="1234567",
+            bound_by_user_id="user-1",
+            verification_source="test",
+        )
+        qbind.approve_personal_binding(
+            self_id="bot-a",
+            user_id="user-1",
+            verified_by="trusted-admin",
+            verification_source="test:review",
+        )
+        store.set_group_pending(
+            bot_scope="bot-a",
+            virtual_group_id="virtual-group-1",
+            real_group_id="9876543",
+            group_name="Test Group",
+            bound_by_user_id="user-1",
+            verification_source="test:manual",
+        )
+
+        self.assertIsNone(
+            qbind.record_verified_membership(
+                self_id="bot-a",
+                group_id="virtual-group-1",
+                user_id="user-1",
+                group_name="Test Group",
+            )
+        )
+
+        store.verify_group(
+            bot_scope="bot-a",
+            virtual_group_id="virtual-group-1",
+            verified_by="trusted-admin",
+            verification_source="test:review",
+        )
+        membership = qbind.record_verified_membership(
+            self_id="bot-a",
+            group_id="virtual-group-1",
+            user_id="user-1",
+            group_name="Test Group",
+        )
+        self.assertIsNotNone(membership)
+        self.assertEqual(membership.real_group_id, "9876543")
+        self.assertEqual(membership.real_user_id, "1234567")
+        self.assertEqual(
+            [row.real_user_id for row in qbind.get_group_members("9876543", "bot-a")],
+            ["1234567"],
+        )
+        self.assertEqual(
+            [row.real_group_id for row in qbind.get_user_groups("1234567", "bot-a")],
+            ["9876543"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

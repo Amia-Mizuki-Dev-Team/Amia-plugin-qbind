@@ -1,19 +1,32 @@
 gensokyo:
   last_verified_release: "010"
   verified_at: "2026-08-01"
-  baseline_commit: "9151721c1dad015df37387b06edf3c18fd0936f3"
+  baseline_commit: "edcab1534ccf13fb45df5e729a60ed4669ec50c2"
   verification:
-    status: partial
-    evidence: ["tests/test_qbind.py"]
+    status: PARTIAL_PASS
+    evidence: ["tests/test_qbind.py", "tests/test_group.py", "tests/test_acceptance_matrix.py", "tests/test_gensokyo_group.py", "_reference/Gensokyo-NewQQ/server/getIDHandler.go"]
+    boundaries:
+      type5_semantics: "STATIC_CONFIRMED_AS_IDMAP_UPDATE_NOT_OWNERSHIP_PROOF"
+      type11_group_user_lookup: "STATIC_CONFIRMED_AND_LOCALLY_ADAPTER_TESTED"
+      group_type5_reuse: "IMPLEMENTED_LOCAL_ONLY"
+      production_backend: "NOT_VERIFIED"
+      real_qq_group_ownership: "NOT_VERIFIED"
   modes:
     string_message: {status: automated, evidence: ["tests/test_qbind.py"]}
     array_message: {status: automated, evidence: ["tests/test_qbind.py"]}
-    use_uin_true: {status: unverified, evidence: []}
-    use_uin_false: {status: unverified, evidence: []}
-    markdown: {status: unverified, evidence: []}
-    keyboard: {status: unverified, evidence: []}
-    file_segment: {status: unverified, evidence: []}
-  automated_tested: true
-  live_tested: false
+    use_uin_true: {status: NOT_VERIFIED, evidence: []}
+    use_uin_false: {status: NOT_VERIFIED, evidence: []}
+    idmap_isolation: {status: STATIC_ONLY, evidence: ["_reference/Gensokyo-NewQQ/template/config_template.go"]}
+    markdown: {status: NOT_VERIFIED, evidence: []}
+    keyboard: {status: NOT_VERIFIED, evidence: []}
+    file_segment: {status: NOT_VERIFIED, evidence: []}
+  automated_tested: PASS
+  local_acceptance_matrix:
+    status: PASS
+    evidence: ["tests/test_acceptance_matrix.py"]
+    coverage: ["10.1 personal binding", "10.2 group binding", "10.3 cross-group identity isolation", "Gensokyo type=11 group/user pair verifier", "personal+group pre-use access gate"]
+  live_tested: NOT_RUN
   known_issues:
-    - "Release010 automated/shared fixtures are partial; repository-specific and live integration remain unverified."
+    - "The cached local Gensokyo source is not proof of the currently deployed Release015 or production binary."
+    - "Normal QGroupBind uses type=5 and exposes a successful mapping as declared; the optional type=11 verifier, deployed semantics and real QQ group ownership evidence remain NOT_VERIFIED until a trusted or email review is connected."
+    - "A real QQ group and hardware/adapter acceptance test is still required before release."
