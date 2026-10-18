@@ -722,8 +722,6 @@ _BINDING_COMMANDS = frozenset(
 _INFORMATION_COMMANDS = frozenset({"help", "menu", "qhelp", "帮助", "菜单"})
 _GUARD_PROMPT_TTL_SECONDS = 30
 _GUARD_PROMPT_CACHE_KEY = "_amia_qbind_guard_prompt_cache"
-_SHARE_NOTICE_TTL_SECONDS = 3600
-_SHARE_NOTICE_CACHE_KEY = "_amia_qbind_share_notice_cache"
 
 
 def _parsed_command_name(state: T_State) -> Optional[str]:
@@ -777,87 +775,6 @@ def _guard_prompt_is_new(event: MessageEvent, kind: str) -> bool:
     if key in cache:
         return False
     cache[key] = now + _GUARD_PROMPT_TTL_SECONDS
-    return True
-
-
-def _share_notice_is_new(
-    event: MessageEvent,
-    *,
-    user_id: str,
-    group_id: str,
-    real_group_id: str,
-) -> bool:
-    """Throttle the successful sharing notice without suppressing new mappings."""
-
-    driver = get_driver()
-    now = time.monotonic()
-    cache = getattr(driver, _SHARE_NOTICE_CACHE_KEY, None)
-    if cache is None:
-        cache = {}
-        setattr(driver, _SHARE_NOTICE_CACHE_KEY, cache)
-    for key, expires_at in tuple(cache.items()):
-        if expires_at <= now:
-            cache.pop(key, None)
-    # The store identity is included so isolated tests/reloads do not inherit
-    # a notice from an older database with the same Bot/user/group IDs.
-    key = ":".join(
-        (
-            str(id(get_store())),
-            str(getattr(event, "self_id", "")),
-            str(user_id),
-            str(group_id),
-            str(real_group_id),
-        )
-    )
-    if key in cache:
-        return False
-    cache[key] = now + _SHARE_NOTICE_TTL_SECONDS
-    return True
-
-
-async def _send_profile_share_notice_once(
-    event: MessageEvent,
-    bot: Bot,
-    *,
-    user_id: str,
-    group_id: str,
-    group_name: str,
-    real_group_id: str,
-) -> bool:
-    if not _share_notice_is_new(
-        event,
-        user_id=user_id,
-        group_id=group_id,
-        real_group_id=real_group_id,
-    ):
-        return False
-    display_name = group_name.strip().replace("`", "'") or "当前群（群名未记录）"
-    await bot.send(
-        event,
-        _reply(
-            "### ✅ 档案访问已启用\n\n"
-            f"> 你的档案已分享至群：**{display_name}**。\n\n"
-            "> 当前个人 QBind 与本群 QGroupBind 均已完成本地绑定声明。\n"
-            "> 只有这个已绑定群可以按当前 Bot 业务读取你的档案；普通聊天不会触发绑定检查。\n"
-            "> 这表示当前 Bot 的群内访问范围已生效，不等于 QQ/群归属的独立所有权核验。",
-            [
-                [
-                    {
-                        "render_data.label": "查看群绑定状态",
-                        "action.data": "qgstatus",
-                        "action.enter": True,
-                    },
-                    {
-                        "render_data.label": "撤回个人共享",
-                        "action.data": "qunbind",
-                        "action.enter": True,
-                        "action.permission.type": 0,
-                        "action.permission.specify_user_ids": [str(user_id)],
-                    },
-                ]
-            ],
-        ),
-    )
     return True
 
 
@@ -925,18 +842,10 @@ async def ensure_context_bound(event: MessageEvent, bot: Bot) -> bool:
                     try:
                         info = await getter(group_id=str(group_id))
                     except Exception:
-                        logger.debug("unable to query group name for share notice", exc_info=True)
+                        logger.debug("unable to query group name for membership archive", exc_info=True)
                     else:
                         if isinstance(info, dict) and info.get("group_name"):
                             group_name = str(info["group_name"]).strip()
-            await _send_profile_share_notice_once(
-                event,
-                bot,
-                user_id=user_id,
-                group_id=str(group_id),
-                group_name=group_name or "当前群（群名未记录）",
-                real_group_id=real_group_id,
-            )
             # The archive is populated only after an explicit Bot command has
             # passed both gates.  Normal group messages never reach this
             # helper, and the storage method independently requires both

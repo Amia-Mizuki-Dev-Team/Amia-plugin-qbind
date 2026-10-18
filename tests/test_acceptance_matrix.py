@@ -252,6 +252,12 @@ class TestAccessGate(AcceptanceBase):
             bound_by_user_id="user-a",
             verification_source="test",
         )
+        qbind.approve_personal_binding(
+            self_id="bot-a",
+            user_id="user-a",
+            verified_by="trusted-reviewer",
+            verification_source="test:review",
+        )
         qbind.get_store().apply_verified_group(
             bot_scope="bot-a",
             virtual_group_id="group-a",
@@ -273,16 +279,65 @@ class TestAccessGate(AcceptanceBase):
             )
         )
         self.assertFalse(matcher.stopped)
-        self.assertEqual(len(bot.sent), 1)
-        self.assertEqual(bot.sent[0][0].type, "markdown")
-        data = bot.sent[0][0].data["data"]
-        self.assertIn("你的档案已分享至群：**Test**", data["markdown"]["content"])
-        self.assertNotIn("9876543", data["markdown"]["content"])
-        buttons = data["keyboard"]["content"]["rows"][0]["buttons"]
+        self.assertEqual(bot.sent, [])
+        members = qbind.get_group_members("9876543", "bot-a")
+        self.assertEqual(len(members), 1)
+        self.assertEqual(members[0].virtual_user_id, "user-a")
+        self.assertEqual(members[0].real_user_id, "1234567")
         self.assertEqual(
-            [button["render_data"]["label"] for button in buttons],
-            ["查看群绑定状态", "撤回个人共享"],
+            members[0].membership_status, qbind.storage.MEMBERSHIP_VERIFIED
         )
+
+    def test_verified_membership_is_idempotent_without_share_notice(self):
+        qbind.get_store().declare_personal(
+            bot_scope="bot-a",
+            external_user_id="user-a",
+            canonical_user_id="1234567",
+            bound_by_user_id="user-a",
+            verification_source="test",
+        )
+        qbind.approve_personal_binding(
+            self_id="bot-a",
+            user_id="user-a",
+            verified_by="trusted-reviewer",
+            verification_source="test:review",
+        )
+        qbind.get_store().apply_verified_group(
+            bot_scope="bot-a",
+            virtual_group_id="group-a",
+            real_group_id="9876543",
+            group_name="Test",
+            bound_by_user_id="admin-a",
+            verified_by="trusted-reviewer",
+            verification_source="test",
+        )
+        event = FakeEvent(
+            "user-a", group_id="group-a", role="member", text="/economy balance"
+        )
+        first_bot = FakeBot()
+        run(
+            qbind.access_guard_handler(
+                event, first_bot, FakeMatcher(), state=parsed_command("economy")
+            )
+        )
+        self.assertEqual(first_bot.sent, [])
+        self.assertEqual(len(qbind.get_group_members("9876543", "bot-a")), 1)
+
+        # Recreate the store exactly as a Bot restart would.  The verified
+        # membership upsert must survive the new QbindStore instance.
+        qbind.configure_storage(
+            Path(self.temporary.name) / "qbind.sqlite3",
+            Path(self.temporary.name) / "binds.json",
+        )
+        qbind._last_cmd_time.clear()
+        second_bot = FakeBot()
+        run(
+            qbind.access_guard_handler(
+                event, second_bot, FakeMatcher(), state=parsed_command("economy")
+            )
+        )
+        self.assertEqual(second_bot.sent, [])
+        self.assertEqual(len(qbind.get_group_members("9876543", "bot-a")), 1)
 
     def test_help_remains_available_for_an_unbound_user(self):
         event = FakeEvent("user-a", group_id="group-a", text="/help")
