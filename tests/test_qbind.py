@@ -20,6 +20,13 @@ _IMPORT_STORE_ROOT = Path(tempfile.mkdtemp(prefix="qbind-import-store-"))
 atexit.register(shutil.rmtree, _IMPORT_STORE_ROOT, ignore_errors=True)
 os.environ["QBIND_DB_PATH"] = str(_IMPORT_STORE_ROOT / "qbind.sqlite3")
 
+# ``failure_log`` freezes ``LOG_DIR`` when it is imported -- which happens while
+# the plugin package is imported below -- and the plugin attaches an ERROR
+# handler at that same moment.  Point the import-time data directory at the same
+# throwaway root, otherwise every *expected* failure in this suite appends to
+# ``<plugin>/data/qbind_log/failures.jsonl``.  Must precede ``load_qbind``.
+os.environ["QBIND_DATA_DIR"] = str(_IMPORT_STORE_ROOT)
+
 from standalone_loader import load_core, load_qbind
 
 
