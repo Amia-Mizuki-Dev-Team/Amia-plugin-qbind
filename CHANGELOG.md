@@ -4,6 +4,9 @@ All notable changes to QBind are documented here.
 
 ## [2026-10-22]
 
+### Added
+- Mirror every failure reported by the plugin loggers into `<data>/qbind_log/failures.jsonl`, keeping the newest 100 JSON records. The writer never raises, so a broken or read-only log cannot break a business request.
+
 ### Changed
 - Group business gates now report the specific local blocking state (missing group binding, declared, pending verification, conflict, revoked, or unverified personal identity) instead of one generic GSK synchronization message.
 - type=5 synchronization is state-aware: each successful write is recorded in SQLite (`gsk_sync_state`) and identical repeats are skipped, because Gensokyo rejects a re-write of an existing mapping instead of treating it as a no-op.
