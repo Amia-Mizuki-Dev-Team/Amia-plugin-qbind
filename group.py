@@ -393,6 +393,49 @@ def _group_email_code_buttons(
     return rows
 
 
+def _group_confirm_buttons(
+    request: ConfirmationRequest, user_id: str, message: str
+) -> list[list[dict[str, Any]]]:
+    """Pick qgconfirm follow-up buttons from the stored outcome.
+
+    The conflict caused by another binding claiming the real group number is
+    only actionable through the existing ``qgunbind <real id>`` flow, so that
+    case gets a dedicated revoke-first keyboard instead of generic navigation.
+    """
+
+    error = (request.last_error or "").casefold()
+    candidate = (request.candidate_id or "").strip()
+    if request.result_code == "conflict" and "already claimed" in error and candidate:
+        return [
+            [
+                {
+                    "render_data.label": "确认撤销该群号",
+                    "action.data": f"qgunbind {candidate}",
+                    "action.enter": True,
+                }
+            ],
+            [
+                {
+                    "render_data.label": "查看群状态",
+                    "action.data": "qgstatus",
+                    "action.enter": True,
+                }
+            ],
+        ]
+    if request.result_code == "email_pending" or "`qgcode <6位验证码>`" in message:
+        return _group_email_code_buttons(
+            user_id,
+            include_status=True,
+            include_rebind=True,
+            include_unbind=True,
+        )
+    return _group_action_buttons(
+        include_status=True,
+        include_rebind=True,
+        include_unbind=True,
+    )
+
+
 def _status_label(status: str) -> str:
     return {
         GROUP_DECLARED: "已声明（可使用，待可信验证）",
@@ -449,6 +492,44 @@ def _get_group_request(
     )
 
 
+def _group_conflict_message(request: ConfirmationRequest) -> str:
+    """Turn a refused group binding into the next executable step.
+
+    A ``conflict`` is not a dead end.  When another group binding already
+    claims the real group number, the operator can only continue by revoking
+    that claim through ``qgunbind <real id>``; a bare failure notice leaves
+    the user with no way forward.
+    """
+
+    error = (request.last_error or "").casefold()
+    candidate = (request.candidate_id or "").strip()
+    if "already claimed" in error:
+        if candidate:
+            return (
+                "### ⚠️ 该真实群号已被其他群绑定占用\n\n"
+                f"> 真实群号：`{candidate}`\n"
+                "> 这个群号当前挂在别的群绑定上，本群无法直接绑定。\n"
+                f"> 请由群主/管理员发送 `qgunbind {candidate}`，"
+                "确认撤销后再重新 `qgbind <真实群号>`。"
+            )
+        return (
+            "### ⚠️ 该真实群号已被其他群绑定占用\n\n"
+            "> 这个群号当前挂在别的群绑定上，本群无法直接绑定。\n"
+            "> 请由群主/管理员发送 `qgunbind <真实群号>`，"
+            "确认撤销后再重新 `qgbind <真实群号>`。"
+        )
+    if "a verified mapping already exists" in error:
+        return (
+            "### ⚠️ 本群已经有已验证绑定\n\n"
+            "> 如需更换真实群号，请使用 `qgrebind <真实群号>`；"
+            "不会直接覆盖现有记录。"
+        )
+    return (
+        "⚠️ 该请求已进入冲突状态，没有覆盖已有群映射。\n"
+        "> 可用 qgstatus 查看当前记录，或联系管理员对账。"
+    )
+
+
 def _request_result_message(request: ConfirmationRequest) -> str:
     if request.result_code == "email_pending":
         return (
@@ -467,7 +548,7 @@ def _request_result_message(request: ConfirmationRequest) -> str:
     if request.result_code == "pending_verification":
         return "⏳ 请求已记录，但真实群号仍待可信来源审核；当前不会向其他插件提供该群号。"
     if request.result_code == "conflict":
-        return "⚠️ 该请求已进入冲突状态，没有覆盖已有群映射。"
+        return _group_conflict_message(request)
     if request.result_code == "revoked":
         return "✅ QBind 本地群绑定已撤销；GSK type=5 不提供可靠删除，远端映射需显式对账。"
     if request.result_code == "failed":
@@ -1250,24 +1331,15 @@ async def qgconfirm_handler(
                 _group_action_buttons(include_status=True),
             )
         )
+    # ``request`` is the snapshot read before the confirmation ran; the store
+    # now holds the outcome that decides which follow-up actions are possible.
+    try:
+        outcome = _store().get_confirmation(request.request_id) or request
+    except QbindStorageError:
+        logger.warning("could not reload the group confirmation outcome", exc_info=True)
+        outcome = request
     await qgconfirm.finish(
-        _message(
-            message,
-            (
-                _group_email_code_buttons(
-                    user_id,
-                    include_status=True,
-                    include_rebind=True,
-                    include_unbind=True,
-                )
-                if "`qgcode <6位验证码>`" in message
-                else _group_action_buttons(
-                    include_status=True,
-                    include_rebind=True,
-                    include_unbind=True,
-                )
-            ),
-        )
+        _message(message, _group_confirm_buttons(outcome, user_id, message))
     )
 
 
