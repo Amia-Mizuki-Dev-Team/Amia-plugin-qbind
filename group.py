@@ -1487,14 +1487,30 @@ async def qgcode_handler(
         group_name=verified.group_name,
         source="qbind.group_verified",
     )
-    await qgcode.finish(
-        _message(
-            "### ✅ 群主 QQ 邮箱认证完成\n\n"
-            f"> 当前群：**{verified.group_name or '当前群'}**\n"
-            "> 当前 Bot 下个人与群 verified 映射已同步；其他用户仍须完成个人 verified 绑定。",
-            _group_action_buttons(include_status=True, include_rebind=True, include_unbind=True),
-        )
+    # The Markdown + keyboard variant of this receipt was silently dropped by
+    # the send/render layer, so the success notice is a plain string with no
+    # buttons: any string is accepted by every adapter, and the fallback keeps
+    # the user informed if even that fails.
+    # A NUL byte truncates the frame at the send layer, and a newline would let
+    # a group name inject extra lines into the receipt.
+    group_label = " ".join(
+        str(verified.group_name or "当前群").replace(chr(0), " ").split()
+    ) or "当前群"
+    summary = (
+        "✅ 群主 QQ 邮箱认证完成\n"
+        f"当前群：{group_label}\n"
+        "个人与群 verified 映射已同步；其他用户仍需完成个人 verified 绑定。\n"
+        "发送 qgstatus 可查看状态与操作按钮。"
     )
+    try:
+        await qgcode.send(summary)
+    except Exception:
+        logger.exception("group verification success reply was not delivered")
+        try:
+            await qgcode.send("✅ 群绑定已完成。发送 qgstatus 查看状态。")
+        except Exception:
+            logger.exception("group verification fallback reply also failed")
+    await qgcode.finish()
 
 
 qgcancel = on_command("qgcancel", priority=5, block=False)
