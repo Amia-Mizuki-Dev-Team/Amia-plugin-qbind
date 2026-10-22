@@ -30,6 +30,7 @@ from nonebot.params import CommandArg, T_State
 from nonebot.plugin import PluginMetadata
 from nonebot.permission import SUPERUSER
 
+from .failure_log import install_failure_handler
 from .gensokyo import (
     GensokyoMappingClient,
     GensokyoMappingError,
@@ -73,6 +74,9 @@ from .storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Mirror every ERROR to data/qbind_log so failures survive without a terminal.
+install_failure_handler(logger)
 
 USE_MARKDOWN = os.getenv("QBIND_USE_MARKDOWN", "true").lower() not in {
     "0",
@@ -1523,6 +1527,9 @@ async def bind_handler(
                 try:
                     await sync_verified_personal_mapping(scope, user_id)
                 except GensokyoMappingMissingError:
+                    logger.exception(
+                        "verified personal mapping sync found no Gensokyo virtual identity record"
+                    )
                     await bind.finish(
                         _reply(
                             "### ⚠️ 远端缺少会话身份记录\n\n"
@@ -1532,6 +1539,9 @@ async def bind_handler(
                         )
                     )
                 except BindingConflictError:
+                    logger.exception(
+                        "verified personal mapping sync hit a cross-bot mapping conflict"
+                    )
                     await bind.finish(
                         _reply(
                             "### ❌ 个人映射冲突\n\n"
@@ -1540,6 +1550,7 @@ async def bind_handler(
                         )
                     )
                 except (GensokyoMappingError, QbindStorageError):
+                    logger.exception("verified personal mapping sync failed")
                     await bind.finish(
                         _reply(
                             "### ❌ GSK 用户映射同步失败\n\n"
@@ -1571,6 +1582,9 @@ async def bind_handler(
                 try:
                     _assert_personal_mapping_consistent(user_id, candidate)
                 except BindingConflictError:
+                    logger.exception(
+                        "declared personal mapping is inconsistent with another bot"
+                    )
                     await bind.finish(
                         _reply(
                             "### ❌ 个人映射冲突\n\n"
@@ -1588,6 +1602,7 @@ async def bind_handler(
                         qq_number=candidate,
                     )
                 except (MailConfigurationError, MailDeliveryError) as error:
+                    logger.exception("personal QQ email verification code delivery failed")
                     await bind.finish(
                         _reply(
                             f"### ❌ 邮箱验证码发送失败\n\n> {error}",
@@ -1641,6 +1656,7 @@ async def bind_handler(
             ttl_seconds=120,
         )
     except QbindStorageError as error:
+        logger.exception("personal binding request could not be persisted")
         await bind.finish(
             _reply(
                 f"### ❌ 绑定请求未保存\n\n> {error}",
@@ -1697,6 +1713,7 @@ async def confirm_handler(
             kind="personal_bind", scope=scope, user_id=user_id, token=token
         )
     except PermissionError as error:
+        logger.exception("confirm_bind request ownership check failed")
         await confirm.finish(
             _reply(
                 f"### ❌ 确认失败\n\n> {error}",
@@ -1804,6 +1821,9 @@ async def confirm_handler(
                 qq_number=candidate,
             )
         except (MailConfigurationError, MailDeliveryError) as error:
+            logger.exception(
+                "personal QQ email verification code delivery failed during confirmation"
+            )
             failed = get_store().complete_confirmation(
                 request.request_id,
                 result_code="failed",
@@ -2152,6 +2172,7 @@ async def qbindcode_handler(
             )
         )
     except BindingConflictError:
+        logger.exception("QQ email verification hit a personal mapping conflict")
         await qbindcode.finish(
             _reply(
                 "### ❌ 个人映射冲突\n\n"
@@ -2207,6 +2228,7 @@ async def cancel_handler(event: MessageEvent, arg: Message = CommandArg()):
             kind="personal_bind", scope=scope, user_id=user_id, token=token
         )
     except PermissionError as error:
+        logger.exception("cancel_bind request ownership check failed")
         await cancel_cmd.finish(
             _reply(
                 f"### ❌ 取消失败\n\n> {error}",
@@ -2390,6 +2412,7 @@ async def unbind_handler(
             kind="personal_unbind", scope=scope, user_id=user_id, token=token
         )
     except PermissionError as error:
+        logger.exception("unbind request ownership check failed")
         await unbind.finish(
             _reply(f"### ❌ 解绑失败\n\n> {error}", _personal_action_buttons(user_id))
         )

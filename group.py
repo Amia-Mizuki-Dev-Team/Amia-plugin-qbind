@@ -20,6 +20,7 @@ from nonebot.adapters import Message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.params import CommandArg
 
+from .failure_log import install_failure_handler
 from .gensokyo import GensokyoMappingClient, GensokyoMappingError
 from .mail import MailConfigurationError, MailDeliveryError, code_digest
 from .storage import (
@@ -41,6 +42,10 @@ from .storage import (
 
 
 logger = logging.getLogger(__name__)
+
+# Mirror every ERROR to data/qbind_log so failures survive without a terminal.
+install_failure_handler(logger)
+
 _GROUP_ID_RE = re.compile(r"^[1-9]\d{4,11}$")
 _REQUEST_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 _GROUP_REQUEST_TTL = 300.0
@@ -135,6 +140,7 @@ class GensokyoGroupVerifier:
                 context.virtual_group_id, context.requested_by_user_id
             )
         except GensokyoMappingError as error:
+            logger.exception("group verification lookup failed")
             return GroupVerificationResult(
                 status="pending",
                 source="gensokyo:type11:consistency_only",
@@ -867,6 +873,9 @@ async def _confirm_group_bind(
                         operation_id=request.request_id,
                     )
                 except BindingConflictError as error:
+                    logger.exception(
+                        "group binding pending transition hit a binding conflict"
+                    )
                     store.mark_group_conflict(
                         bot_scope=scope,
                         virtual_group_id=group_id,
@@ -1217,6 +1226,7 @@ async def qgconfirm_handler(
                 token=None,
             )
     except PermissionError as error:
+        logger.exception("qgconfirm request ownership check failed")
         await qgconfirm.finish(
             _message(
                 f"### ❌ 确认失败\n\n> {error}",
@@ -1233,6 +1243,7 @@ async def qgconfirm_handler(
     try:
         message = await _confirm_group_bind(event, bot, request)
     except PermissionError as error:
+        logger.exception("group binding confirmation failed")
         await qgconfirm.finish(
             _message(
                 f"### ❌ 确认失败\n\n> {error}",
@@ -1637,6 +1648,7 @@ async def qgunbind_handler(event: GroupMessageEvent, arg: Message = CommandArg()
             operation_id=request.request_id,
         )
     except (BindingConflictError, QbindStorageError) as error:
+        logger.exception("group unbind could not revoke the local group binding")
         failed = _store().complete_confirmation(
             request.request_id,
             result_code="conflict",
