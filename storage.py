@@ -53,6 +53,10 @@ EMAIL_CHALLENGE_EXPIRED = "expired"
 EMAIL_CHALLENGE_CANCELED = "canceled"
 EMAIL_CHALLENGE_FAILED = "failed"
 
+# Kind discriminator for ``gsk_sync_state``: which type=5 write a row records.
+MAPPING_PERSONAL = "personal"
+MAPPING_GROUP = "group"
+
 
 class QbindStorageError(RuntimeError):
     """Base class for storage and state-transition failures."""
@@ -114,6 +118,32 @@ class GroupBinding:
     updated_at: str
     version: int
     last_error: Optional[str]
+
+
+@dataclass(frozen=True)
+class VerifiedPair:
+    """Same-Bot personal and group bindings, both independently verified."""
+
+    personal: PersonalBinding
+    group: GroupBinding
+
+
+@dataclass(frozen=True)
+class GskSyncState:
+    """The local row version whose type=5 write Gensokyo already accepted.
+
+    QBind rewrites GSK mappings only when the recorded ``(canonical_id,
+    local_version)`` no longer matches the live binding row, because a repeat
+    write of an existing value is rejected by Gensokyo rather than being
+    idempotent.
+    """
+
+    bot_scope: str
+    external_id: str
+    mapping_kind: str
+    canonical_id: str
+    local_version: int
+    synced_at: str
 
 
 @dataclass(frozen=True)
@@ -382,6 +412,16 @@ class QbindStore:
                         meta_key TEXT PRIMARY KEY,
                         meta_value TEXT NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS gsk_sync_state (
+                        bot_scope TEXT NOT NULL,
+                        external_id TEXT NOT NULL,
+                        mapping_kind TEXT NOT NULL,
+                        canonical_id TEXT NOT NULL,
+                        local_version INTEGER NOT NULL,
+                        synced_at TEXT NOT NULL,
+                        PRIMARY KEY (bot_scope, external_id, mapping_kind)
+                    );
                     """
                 )
                 # A trusted real identity may legitimately have more than one
@@ -524,6 +564,19 @@ class QbindStore:
             updated_at=row["updated_at"],
         )
 
+    @staticmethod
+    def _gsk_sync_from_row(row: Optional[sqlite3.Row]) -> Optional[GskSyncState]:
+        if row is None:
+            return None
+        return GskSyncState(
+            bot_scope=str(row["bot_scope"]),
+            external_id=str(row["external_id"]),
+            mapping_kind=str(row["mapping_kind"]),
+            canonical_id=str(row["canonical_id"]),
+            local_version=int(row["local_version"]),
+            synced_at=str(row["synced_at"]),
+        )
+
     def _audit_tx(
         self,
         connection: sqlite3.Connection,
@@ -567,6 +620,42 @@ class QbindStore:
             "migration_error": self.migration_error,
         }
 
+    def list_active_personal_bindings(self) -> list[PersonalBinding]:
+        """Return active personal declarations/verification records with a canonical ID."""
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM personal_bindings
+                    WHERE binding_status IN (?, ?) AND canonical_user_id IS NOT NULL
+                      AND TRIM(canonical_user_id) <> ''
+                    ORDER BY external_user_id, bot_scope
+                    """,
+                    (PERSONAL_DECLARED, PERSONAL_VERIFIED),
+                ).fetchall()
+                return [self._personal_from_row(row) for row in rows]
+            finally:
+                connection.close()
+
+    def list_locally_resolvable_personal_bindings(self) -> list[PersonalBinding]:
+        """Return bindings whose canonical identity is still exposed locally."""
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM personal_bindings
+                    WHERE binding_status IN (?, ?, ?) AND canonical_user_id IS NOT NULL
+                      AND TRIM(canonical_user_id) <> ''
+                    ORDER BY external_user_id, bot_scope
+                    """,
+                    (PERSONAL_DECLARED, PERSONAL_VERIFIED, PERSONAL_UNBIND_PENDING),
+                ).fetchall()
+                return [self._personal_from_row(row) for row in rows]
+            finally:
+                connection.close()
+
     def get_personal(self, bot_scope: object, external_user_id: object) -> Optional[PersonalBinding]:
         scope = _normalise(bot_scope, "bot_scope")
         user_id = _normalise(external_user_id, "external_user_id")
@@ -604,6 +693,33 @@ class QbindStore:
             finally:
                 connection.close()
 
+    def list_active_personal_by_canonical(
+        self, bot_scope: object, canonical_user_id: object
+    ) -> list[PersonalBinding]:
+        scope = _normalise(bot_scope, "bot_scope")
+        canonical = _normalise(canonical_user_id, "canonical_user_id")
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM personal_bindings
+                    WHERE bot_scope = ? AND canonical_user_id = ?
+                      AND binding_status IN (?, ?, ?)
+                    ORDER BY external_user_id, version DESC
+                    """,
+                    (
+                        scope,
+                        canonical,
+                        PERSONAL_DECLARED,
+                        PERSONAL_VERIFIED,
+                        PERSONAL_UNBIND_PENDING,
+                    ),
+                ).fetchall()
+                return [self._personal_from_row(row) for row in rows]
+            finally:
+                connection.close()
+
     def declare_personal(
         self,
         *,
@@ -620,8 +736,6 @@ class QbindStore:
         canonical = _normalise(canonical_user_id, "canonical_user_id")
         actor = _normalise(bound_by_user_id, "bound_by_user_id")
         source = _normalise(verification_source, "verification_source")
-        if user_id == canonical:
-            raise BindingConflictError("virtual user ID and canonical QQ must differ")
 
         try:
             with self._transaction() as connection:
@@ -742,6 +856,178 @@ class QbindStore:
         except sqlite3.IntegrityError as error:
             raise BindingConflictError("personal binding conflicts with an existing identity") from error
 
+    def _assert_verified_personal_alias_available_tx(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        bot_scope: str,
+        external_user_id: str,
+        canonical_user_id: str,
+        reject_revoked_target: bool = False,
+    ) -> Optional[PersonalBinding]:
+        row = connection.execute(
+            """
+            SELECT * FROM personal_bindings
+            WHERE bot_scope = ? AND external_user_id = ?
+            """,
+            (bot_scope, external_user_id),
+        ).fetchone()
+        current = self._personal_from_row(row)
+        allowed_existing = (
+            current is not None
+            and current.binding_status == PERSONAL_VERIFIED
+            and current.canonical_user_id == canonical_user_id
+        )
+        if (
+            reject_revoked_target
+            and current is not None
+            and current.binding_status == PERSONAL_REVOKED
+        ):
+            raise BindingConflictError(
+                "a revoked alias event key cannot be reused during email retry"
+            )
+        if current is not None and current.binding_status != PERSONAL_REVOKED:
+            if not allowed_existing:
+                raise BindingConflictError(
+                    "the alias event key already has an active binding"
+                )
+
+        owner_rows = connection.execute(
+            """
+            SELECT binding_status FROM personal_bindings
+            WHERE bot_scope = ? AND canonical_user_id = ?
+              AND external_user_id <> ?
+              AND binding_status IN ('declared', 'verified', 'unbind_pending')
+            """,
+            (bot_scope, canonical_user_id, external_user_id),
+        ).fetchall()
+        if any(row["binding_status"] != PERSONAL_VERIFIED for row in owner_rows):
+            raise BindingConflictError(
+                "the canonical QQ has a pending or declared owner in this Bot namespace"
+            )
+        return current
+
+    def _assert_verified_personal_email_alias_source_tx(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        bot_scope: str,
+        source_external_user_id: str,
+        canonical_user_id: str,
+        email_challenge_id: str,
+        source_expected_version: int,
+        require_unique_challenge: bool = False,
+    ) -> None:
+        source_row = connection.execute(
+            """
+            SELECT * FROM personal_bindings
+            WHERE bot_scope = ? AND external_user_id = ?
+            """,
+            (bot_scope, source_external_user_id),
+        ).fetchone()
+        source = self._personal_from_row(source_row)
+        if (
+            source is None
+            or source.binding_status != PERSONAL_VERIFIED
+            or source.canonical_user_id != canonical_user_id
+            or source.version != source_expected_version
+        ):
+            raise QbindStorageError(
+                "email alias source is not a matching verified personal binding"
+            )
+
+        challenge_rows = connection.execute(
+            """
+            SELECT challenge_id FROM email_challenges
+            WHERE purpose = ? AND bot_scope = ? AND actor_user_id = ?
+              AND external_user_id = ? AND external_group_id IS NULL
+              AND candidate_id = ? AND status = ?
+            """,
+            (
+                "personal_bind",
+                bot_scope,
+                source_external_user_id,
+                source_external_user_id,
+                canonical_user_id,
+                EMAIL_CHALLENGE_VERIFIED,
+            ),
+        ).fetchall()
+        matching_challenge = any(
+            row["challenge_id"] == email_challenge_id for row in challenge_rows
+        )
+        if not matching_challenge or (
+            require_unique_challenge
+            and (
+                len(challenge_rows) != 1
+                or challenge_rows[0]["challenge_id"] != email_challenge_id
+            )
+        ):
+            raise QbindStorageError(
+                "email alias challenge is not a matching verified personal challenge"
+            )
+
+    def assert_verified_personal_alias_available(
+        self,
+        *,
+        bot_scope: object,
+        external_user_id: object,
+        canonical_user_id: object,
+        source_external_user_id: Optional[object] = None,
+        email_challenge_id: Optional[object] = None,
+        source_expected_version: Optional[int] = None,
+        require_unique_challenge: bool = False,
+        reject_revoked_target: bool = False,
+    ) -> None:
+        """Preflight a verified alias; link_verified_personal rechecks atomically."""
+
+        scope = _normalise(bot_scope, "bot_scope")
+        user_id = _normalise(external_user_id, "external_user_id")
+        canonical = _normalise(canonical_user_id, "canonical_user_id")
+        source_context = (
+            source_external_user_id,
+            email_challenge_id,
+            source_expected_version,
+        )
+        if any(value is not None for value in source_context) and not all(
+            value is not None for value in source_context
+        ):
+            raise ValueError(
+                "source_external_user_id, email_challenge_id, and "
+                "source_expected_version must be supplied together"
+            )
+        source_user_id = (
+            _normalise(source_external_user_id, "source_external_user_id")
+            if source_external_user_id is not None
+            else None
+        )
+        challenge_id = (
+            _normalise(email_challenge_id, "email_challenge_id")
+            if email_challenge_id is not None
+            else None
+        )
+        with self._transaction() as connection:
+            if (
+                source_user_id is not None
+                and challenge_id is not None
+                and source_expected_version is not None
+            ):
+                self._assert_verified_personal_email_alias_source_tx(
+                    connection,
+                    bot_scope=scope,
+                    source_external_user_id=source_user_id,
+                    canonical_user_id=canonical,
+                    email_challenge_id=challenge_id,
+                    source_expected_version=source_expected_version,
+                    require_unique_challenge=require_unique_challenge,
+                )
+            self._assert_verified_personal_alias_available_tx(
+                connection,
+                bot_scope=scope,
+                external_user_id=user_id,
+                canonical_user_id=canonical,
+                reject_revoked_target=reject_revoked_target,
+            )
+
     def link_verified_personal(
         self,
         *,
@@ -752,32 +1038,155 @@ class QbindStore:
         verified_by: object,
         verification_source: str,
         operation_id: Optional[str] = None,
+        source_external_user_id: Optional[object] = None,
+        email_challenge_id: Optional[object] = None,
+        source_expected_version: Optional[int] = None,
+        require_unique_challenge: bool = False,
+        reject_revoked_target: bool = False,
     ) -> PersonalBinding:
-        """Add a virtual alias only after trusted proof of the real identity."""
+        """Atomically add a trusted verified alias without an interim declaration."""
 
-        current = self.get_personal(bot_scope, external_user_id)
-        if (
-            current is not None
-            and current.binding_status == PERSONAL_VERIFIED
-            and current.canonical_user_id == str(canonical_user_id).strip()
+        scope = _normalise(bot_scope, "bot_scope")
+        user_id = _normalise(external_user_id, "external_user_id")
+        canonical = _normalise(canonical_user_id, "canonical_user_id")
+        actor = _normalise(bound_by_user_id, "bound_by_user_id")
+        verifier = _normalise(verified_by, "verified_by")
+        source = _normalise(verification_source, "verification_source")
+        source_context = (
+            source_external_user_id,
+            email_challenge_id,
+            source_expected_version,
+        )
+        if any(value is not None for value in source_context) and not all(
+            value is not None for value in source_context
         ):
-            return current
-        self.declare_personal(
-            bot_scope=bot_scope,
-            external_user_id=external_user_id,
-            canonical_user_id=canonical_user_id,
-            bound_by_user_id=bound_by_user_id,
-            verification_source=verification_source,
-            operation_id=operation_id,
-            allow_verified_canonical_reuse=True,
+            raise ValueError(
+                "source_external_user_id, email_challenge_id, and "
+                "source_expected_version must be supplied together"
+            )
+        source_user_id = (
+            _normalise(source_external_user_id, "source_external_user_id")
+            if source_external_user_id is not None
+            else None
         )
-        return self.verify_personal(
-            bot_scope=bot_scope,
-            external_user_id=external_user_id,
-            verified_by=verified_by,
-            verification_source=verification_source,
-            operation_id=operation_id,
+        challenge_id = (
+            _normalise(email_challenge_id, "email_challenge_id")
+            if email_challenge_id is not None
+            else None
         )
+
+        try:
+            with self._transaction() as connection:
+                if (
+                    source_user_id is not None
+                    and challenge_id is not None
+                    and source_expected_version is not None
+                ):
+                    self._assert_verified_personal_email_alias_source_tx(
+                        connection,
+                        bot_scope=scope,
+                        source_external_user_id=source_user_id,
+                        canonical_user_id=canonical,
+                        email_challenge_id=challenge_id,
+                        source_expected_version=source_expected_version,
+                        require_unique_challenge=require_unique_challenge,
+                    )
+                current = self._assert_verified_personal_alias_available_tx(
+                    connection,
+                    bot_scope=scope,
+                    external_user_id=user_id,
+                    canonical_user_id=canonical,
+                    reject_revoked_target=reject_revoked_target,
+                )
+                if (
+                    current is not None
+                    and current.binding_status == PERSONAL_VERIFIED
+                    and current.canonical_user_id == canonical
+                ):
+                    return current
+
+                now = _now()
+                if current is None:
+                    connection.execute(
+                        """
+                        INSERT INTO personal_bindings (
+                            bot_scope, external_user_id, canonical_user_id,
+                            binding_status, verification_source,
+                            bound_by_user_id, verified_by, created_at,
+                            verified_at, updated_at, version, last_error
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL)
+                        """,
+                        (
+                            scope,
+                            user_id,
+                            canonical,
+                            PERSONAL_VERIFIED,
+                            source,
+                            actor,
+                            verifier,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    old_status = None
+                    version = 1
+                else:
+                    connection.execute(
+                        """
+                        UPDATE personal_bindings
+                        SET canonical_user_id = ?, binding_status = ?,
+                            verification_source = ?, bound_by_user_id = ?,
+                            verified_by = ?, verified_at = ?, updated_at = ?,
+                            version = version + 1, last_error = NULL
+                        WHERE bot_scope = ? AND external_user_id = ?
+                        """,
+                        (
+                            canonical,
+                            PERSONAL_VERIFIED,
+                            source,
+                            actor,
+                            verifier,
+                            now,
+                            now,
+                            scope,
+                            user_id,
+                        ),
+                    )
+                    old_status = current.binding_status
+                    version = current.version + 1
+
+                self._audit_tx(
+                    connection,
+                    event_type="personal.alias_verified",
+                    bot_scope=scope,
+                    subject_type="user",
+                    subject_value=user_id,
+                    actor_user_id=verifier,
+                    from_status=old_status,
+                    to_status=PERSONAL_VERIFIED,
+                    operation_id=operation_id,
+                    details={
+                        "canonical_digest": _digest(scope, canonical),
+                        "verification_source": source,
+                        "version": version,
+                    },
+                )
+                row = connection.execute(
+                    """
+                    SELECT * FROM personal_bindings
+                    WHERE bot_scope = ? AND external_user_id = ?
+                    """,
+                    (scope, user_id),
+                ).fetchone()
+                result = self._personal_from_row(row)
+                if result is None:
+                    raise QbindStorageError("verified alias disappeared after write")
+                return result
+        except sqlite3.IntegrityError as error:
+            raise BindingConflictError(
+                "verified alias conflicts with an existing identity"
+            ) from error
 
     def verify_personal(
         self,
@@ -1000,6 +1409,16 @@ class QbindStore:
                 """,
                 (PERSONAL_REVOKED, now, scope, user_id),
             )
+            # The remote type=5 mapping is not deleted (no reliable delete
+            # contract), but the local "already written" marker must not
+            # outlive the identity it describes.
+            connection.execute(
+                """
+                DELETE FROM gsk_sync_state
+                WHERE bot_scope = ? AND external_id = ? AND mapping_kind = ?
+                """,
+                (scope, user_id, MAPPING_PERSONAL),
+            )
             self._audit_tx(
                 connection,
                 event_type="personal.unbound",
@@ -1042,6 +1461,172 @@ class QbindStore:
                 return self._group_from_row(row)
             finally:
                 connection.close()
+
+    def list_locally_resolvable_group_bindings(self) -> list[GroupBinding]:
+        """Return real group targets guarding global maps, including conflicts."""
+
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM group_bindings
+                    WHERE binding_status IN (?, ?, ?, ?)
+                      AND real_group_id IS NOT NULL
+                      AND TRIM(real_group_id) <> ''
+                    ORDER BY virtual_group_id, bot_scope
+                    """,
+                    (
+                        GROUP_DECLARED,
+                        GROUP_PENDING_VERIFICATION,
+                        GROUP_VERIFIED,
+                        GROUP_CONFLICT,
+                    ),
+                ).fetchall()
+                return [self._group_from_row(row) for row in rows]
+            finally:
+                connection.close()
+
+    def get_verified_pair(
+        self,
+        self_id: object,
+        user_id: object,
+        group_id: object,
+    ) -> Optional[VerifiedPair]:
+        """Read both verified bindings from one Bot-scoped SQLite snapshot."""
+
+        scope = _normalise(self_id, "bot_scope")
+        user = _normalise(user_id, "external_user_id")
+        group = _normalise(group_id, "virtual_group_id")
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN")
+                personal_row = connection.execute(
+                    """
+                    SELECT * FROM personal_bindings
+                    WHERE bot_scope = ? AND external_user_id = ?
+                    """,
+                    (scope, user),
+                ).fetchone()
+                group_row = connection.execute(
+                    """
+                    SELECT * FROM group_bindings
+                    WHERE bot_scope = ? AND virtual_group_id = ?
+                    """,
+                    (scope, group),
+                ).fetchone()
+                personal = self._personal_from_row(personal_row)
+                group_binding = self._group_from_row(group_row)
+                connection.commit()
+                if (
+                    personal is None
+                    or personal.binding_status != PERSONAL_VERIFIED
+                    or not personal.canonical_user_id
+                    or group_binding is None
+                    or group_binding.binding_status != GROUP_VERIFIED
+                    or not group_binding.real_group_id
+                ):
+                    return None
+                return VerifiedPair(personal=personal, group=group_binding)
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    def get_gsk_sync(
+        self, bot_scope: object, external_id: object, mapping_kind: object
+    ) -> Optional[GskSyncState]:
+        """Return the recorded remote type=5 write for one local subject."""
+
+        scope = _normalise(bot_scope, "bot_scope")
+        external = _normalise(external_id, "external_id")
+        kind = _normalise(mapping_kind, "mapping_kind")
+        with self._lock:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    """
+                    SELECT * FROM gsk_sync_state
+                    WHERE bot_scope = ? AND external_id = ? AND mapping_kind = ?
+                    """,
+                    (scope, external, kind),
+                ).fetchone()
+                return self._gsk_sync_from_row(row)
+            finally:
+                connection.close()
+
+    def record_gsk_sync(
+        self,
+        *,
+        bot_scope: object,
+        external_id: object,
+        mapping_kind: object,
+        canonical_id: object,
+        local_version: object,
+    ) -> GskSyncState:
+        """Upsert the local row version whose type=5 write Gensokyo accepted."""
+
+        scope = _normalise(bot_scope, "bot_scope")
+        external = _normalise(external_id, "external_id")
+        kind = _normalise(mapping_kind, "mapping_kind")
+        canonical = _normalise(canonical_id, "canonical_id")
+        try:
+            version = int(local_version)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as error:
+            raise QbindStorageError("local_version must be an integer") from error
+        synced_at = _now()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO gsk_sync_state (
+                    bot_scope, external_id, mapping_kind,
+                    canonical_id, local_version, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (bot_scope, external_id, mapping_kind) DO UPDATE SET
+                    canonical_id = excluded.canonical_id,
+                    local_version = excluded.local_version,
+                    synced_at = excluded.synced_at
+                """,
+                (scope, external, kind, canonical, version, synced_at),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM gsk_sync_state
+                WHERE bot_scope = ? AND external_id = ? AND mapping_kind = ?
+                """,
+                (scope, external, kind),
+            ).fetchone()
+            state = self._gsk_sync_from_row(row)
+        if state is None:
+            raise QbindStorageError("gsk sync state disappeared after write")
+        return state
+
+    def clear_gsk_sync(
+        self,
+        *,
+        bot_scope: object,
+        external_id: Optional[object] = None,
+        mapping_kind: Optional[object] = None,
+    ) -> int:
+        """Delete recorded type=5 writes, narrowed by the given conditions."""
+
+        scope = _normalise(bot_scope, "bot_scope")
+        clauses = ["bot_scope = ?"]
+        params: list[object] = [scope]
+        if external_id is not None:
+            clauses.append("external_id = ?")
+            params.append(_normalise(external_id, "external_id"))
+        if mapping_kind is not None:
+            clauses.append("mapping_kind = ?")
+            params.append(_normalise(mapping_kind, "mapping_kind"))
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM gsk_sync_state WHERE {' AND '.join(clauses)}",
+                tuple(params),
+            )
+            return int(cursor.rowcount or 0)
 
     def get_group_by_real(
         self, bot_scope: object, real_group_id: object
@@ -1263,6 +1848,153 @@ class QbindStore:
             finally:
                 connection.close()
 
+    def _set_group_pending_tx(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        scope: str,
+        virtual_id: str,
+        real_id: str,
+        group_name: Optional[str],
+        actor: str,
+        source: str,
+        operation_id: Optional[str],
+        allow_replace: bool,
+        binding_status: str,
+    ) -> GroupBinding:
+        current_row = connection.execute(
+            """
+            SELECT * FROM group_bindings
+            WHERE bot_scope = ? AND virtual_group_id = ?
+            """,
+            (scope, virtual_id),
+        ).fetchone()
+        current = self._group_from_row(current_row)
+        if current and current.binding_status == GROUP_VERIFIED and not allow_replace:
+            raise BindingConflictError("the virtual group already has a verified binding")
+        if (
+            current
+            and current.binding_status == binding_status
+            and current.real_group_id == real_id
+        ):
+            return current
+
+        other_row = connection.execute(
+            """
+            SELECT * FROM group_bindings
+            WHERE bot_scope = ? AND real_group_id = ?
+              AND virtual_group_id <> ?
+              AND binding_status IN ('verified', 'pending_verification', 'declared')
+            LIMIT 1
+            """,
+            (scope, real_id, virtual_id),
+        ).fetchone()
+        if other_row is not None:
+            raise BindingConflictError(
+                "the real group ID is already claimed in this Bot namespace"
+            )
+
+        now = _now()
+        if current is None:
+            connection.execute(
+                """
+                INSERT INTO group_bindings (
+                    bot_scope, virtual_group_id, real_group_id,
+                    group_name, binding_status, verification_source,
+                    bound_by_user_id, verified_by, created_at,
+                    verified_at, updated_at, version, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, 1, NULL)
+                """,
+                (
+                    scope,
+                    virtual_id,
+                    real_id,
+                    group_name,
+                    binding_status,
+                    source,
+                    actor,
+                    now,
+                    now,
+                ),
+            )
+            old_status = None
+            version = 1
+        else:
+            connection.execute(
+                """
+                INSERT INTO group_binding_history (
+                    bot_scope, virtual_group_id, real_group_id,
+                    binding_status, operation_id, actor_user_id,
+                    verification_source, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope,
+                    virtual_id,
+                    current.real_group_id,
+                    current.binding_status,
+                    operation_id,
+                    actor,
+                    current.verification_source,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE group_bindings
+                SET real_group_id = ?, group_name = ?,
+                    binding_status = ?, verification_source = ?,
+                    bound_by_user_id = ?, verified_by = NULL,
+                    verified_at = NULL, updated_at = ?,
+                    version = version + 1, last_error = NULL
+                WHERE bot_scope = ? AND virtual_group_id = ?
+                """,
+                (
+                    real_id,
+                    group_name,
+                    binding_status,
+                    source,
+                    actor,
+                    now,
+                    scope,
+                    virtual_id,
+                ),
+            )
+            old_status = current.binding_status
+            version = current.version + 1
+
+        self._audit_tx(
+            connection,
+            event_type=(
+                "group.declared"
+                if binding_status == GROUP_DECLARED
+                else "group.verification_pending"
+            ),
+            bot_scope=scope,
+            subject_type="group",
+            subject_value=virtual_id,
+            actor_user_id=actor,
+            from_status=old_status,
+            to_status=binding_status,
+            operation_id=operation_id,
+            details={
+                "real_group_digest": _digest(scope, real_id),
+                "verification_source": source,
+                "version": version,
+            },
+        )
+        row = connection.execute(
+            """
+            SELECT * FROM group_bindings
+            WHERE bot_scope = ? AND virtual_group_id = ?
+            """,
+            (scope, virtual_id),
+        ).fetchone()
+        result = self._group_from_row(row)
+        if result is None:
+            raise QbindStorageError("group binding disappeared after write")
+        return result
+
     def set_group_pending(
         self,
         *,
@@ -1285,138 +2017,18 @@ class QbindStore:
             raise ValueError("group binding status must be declared or pending_verification")
         try:
             with self._transaction() as connection:
-                current_row = connection.execute(
-                    """
-                    SELECT * FROM group_bindings
-                    WHERE bot_scope = ? AND virtual_group_id = ?
-                    """,
-                    (scope, virtual_id),
-                ).fetchone()
-                current = self._group_from_row(current_row)
-                if current and current.binding_status == GROUP_VERIFIED and not allow_replace:
-                    raise BindingConflictError("the virtual group already has a verified binding")
-                if (
-                    current
-                    and current.binding_status == binding_status
-                    and current.real_group_id == real_id
-                ):
-                    return current
-
-                other_row = connection.execute(
-                    """
-                    SELECT * FROM group_bindings
-                    WHERE bot_scope = ? AND real_group_id = ?
-                      AND virtual_group_id <> ?
-                      AND binding_status IN ('verified', 'pending_verification', 'declared')
-                    LIMIT 1
-                    """,
-                    (scope, real_id, virtual_id),
-                ).fetchone()
-                if other_row is not None:
-                    raise BindingConflictError(
-                        "the real group ID is already claimed in this Bot namespace"
-                    )
-
-                now = _now()
-                if current is None:
-                    connection.execute(
-                        """
-                        INSERT INTO group_bindings (
-                            bot_scope, virtual_group_id, real_group_id,
-                            group_name, binding_status, verification_source,
-                            bound_by_user_id, verified_by, created_at,
-                            verified_at, updated_at, version, last_error
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, 1, NULL)
-                        """,
-                        (
-                            scope,
-                            virtual_id,
-                            real_id,
-                            group_name,
-                            binding_status,
-                            source,
-                            actor,
-                            now,
-                            now,
-                        ),
-                    )
-                    old_status = None
-                    version = 1
-                else:
-                    connection.execute(
-                        """
-                        INSERT INTO group_binding_history (
-                            bot_scope, virtual_group_id, real_group_id,
-                            binding_status, operation_id, actor_user_id,
-                            verification_source, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            scope,
-                            virtual_id,
-                            current.real_group_id,
-                            current.binding_status,
-                            operation_id,
-                            actor,
-                            current.verification_source,
-                            now,
-                        ),
-                    )
-                    connection.execute(
-                        """
-                        UPDATE group_bindings
-                        SET real_group_id = ?, group_name = ?,
-                            binding_status = ?, verification_source = ?,
-                            bound_by_user_id = ?, verified_by = NULL,
-                            verified_at = NULL, updated_at = ?,
-                            version = version + 1, last_error = NULL
-                        WHERE bot_scope = ? AND virtual_group_id = ?
-                        """,
-                        (
-                            real_id,
-                            group_name,
-                            binding_status,
-                            source,
-                            actor,
-                            now,
-                            scope,
-                            virtual_id,
-                        ),
-                    )
-                    old_status = current.binding_status
-                    version = current.version + 1
-
-                self._audit_tx(
+                return self._set_group_pending_tx(
                     connection,
-                    event_type=(
-                        "group.declared"
-                        if binding_status == GROUP_DECLARED
-                        else "group.verification_pending"
-                    ),
-                    bot_scope=scope,
-                    subject_type="group",
-                    subject_value=virtual_id,
-                    actor_user_id=actor,
-                    from_status=old_status,
-                    to_status=binding_status,
+                    scope=scope,
+                    virtual_id=virtual_id,
+                    real_id=real_id,
+                    group_name=group_name,
+                    actor=actor,
+                    source=source,
                     operation_id=operation_id,
-                    details={
-                        "real_group_digest": _digest(scope, real_id),
-                        "verification_source": source,
-                        "version": version,
-                    },
+                    allow_replace=allow_replace,
+                    binding_status=binding_status,
                 )
-                row = connection.execute(
-                    """
-                    SELECT * FROM group_bindings
-                    WHERE bot_scope = ? AND virtual_group_id = ?
-                    """,
-                    (scope, virtual_id),
-                ).fetchone()
-                result = self._group_from_row(row)
-                if result is None:
-                    raise QbindStorageError("group binding disappeared after write")
-                return result
         except sqlite3.IntegrityError as error:
             raise BindingConflictError("group binding conflicts with an existing identity") from error
 
@@ -1710,6 +2322,117 @@ class QbindStore:
         except sqlite3.IntegrityError as error:
             raise BindingConflictError("group binding conflicts with an existing identity") from error
 
+    def mark_group_conflict_from_verification(
+        self,
+        *,
+        bot_scope: object,
+        virtual_group_id: object,
+        real_group_id: object,
+        group_name: Optional[str],
+        bound_by_user_id: object,
+        verification_source: str,
+        error: str,
+        operation_id: Optional[str],
+        expected_version: Optional[int],
+        expected_absent: bool,
+        allow_replace: bool = False,
+    ) -> Optional[GroupBinding]:
+        """Apply a verifier conflict only if its pre-await snapshot still matches."""
+
+        scope = _normalise(bot_scope, "bot_scope")
+        virtual_id = _normalise(virtual_group_id, "virtual_group_id")
+        real_id = _normalise(real_group_id, "real_group_id")
+        actor = _normalise(bound_by_user_id, "bound_by_user_id")
+        source = _normalise(verification_source, "verification_source")
+        if expected_absent == (expected_version is not None):
+            raise ValueError("provide exactly one expected group binding state")
+
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM group_bindings
+                WHERE bot_scope = ? AND virtual_group_id = ?
+                """,
+                (scope, virtual_id),
+            ).fetchone()
+            current = self._group_from_row(row)
+            if expected_absent:
+                if current is not None:
+                    return None
+            elif current is None or current.version != expected_version:
+                return None
+
+            connection.execute("SAVEPOINT group_conflict_pending")
+            try:
+                pending = self._set_group_pending_tx(
+                    connection,
+                    scope=scope,
+                    virtual_id=virtual_id,
+                    real_id=real_id,
+                    group_name=group_name,
+                    actor=actor,
+                    source=source,
+                    operation_id=operation_id,
+                    allow_replace=allow_replace,
+                    binding_status=GROUP_PENDING_VERIFICATION,
+                )
+            except (BindingConflictError, sqlite3.IntegrityError):
+                connection.execute("ROLLBACK TO SAVEPOINT group_conflict_pending")
+                connection.execute("RELEASE SAVEPOINT group_conflict_pending")
+                if current is None:
+                    return None
+                target = current
+            else:
+                connection.execute("RELEASE SAVEPOINT group_conflict_pending")
+                target = pending
+
+            now = _now()
+            cursor = connection.execute(
+                """
+                UPDATE group_bindings
+                SET binding_status = ?, last_error = ?, updated_at = ?,
+                    version = version + 1
+                WHERE bot_scope = ? AND virtual_group_id = ? AND version = ?
+                """,
+                (
+                    GROUP_CONFLICT,
+                    str(error)[:1000],
+                    now,
+                    scope,
+                    virtual_id,
+                    target.version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            connection.execute(
+                """
+                DELETE FROM gsk_sync_state
+                WHERE bot_scope = ? AND external_id = ? AND mapping_kind = ?
+                """,
+                (scope, virtual_id, MAPPING_GROUP),
+            )
+            self._audit_tx(
+                connection,
+                event_type="group.conflict",
+                bot_scope=scope,
+                subject_type="group",
+                subject_value=virtual_id,
+                actor_user_id=target.bound_by_user_id,
+                from_status=target.binding_status,
+                to_status=GROUP_CONFLICT,
+                operation_id=operation_id,
+                details={"error": str(error)[:300]},
+            )
+            updated = connection.execute(
+                """
+                SELECT * FROM group_bindings
+                WHERE bot_scope = ? AND virtual_group_id = ?
+                """,
+                (scope, virtual_id),
+            ).fetchone()
+            return self._group_from_row(updated)
+
     def mark_group_conflict(
         self,
         *,
@@ -1717,6 +2440,7 @@ class QbindStore:
         virtual_group_id: object,
         error: str,
         operation_id: Optional[str] = None,
+        expected_version: Optional[int] = None,
     ) -> Optional[GroupBinding]:
         scope = _normalise(bot_scope, "bot_scope")
         virtual_id = _normalise(virtual_group_id, "virtual_group_id")
@@ -1731,6 +2455,8 @@ class QbindStore:
             current = self._group_from_row(row)
             if current is None:
                 return None
+            if expected_version is not None and current.version != expected_version:
+                return current
             now = _now()
             connection.execute(
                 """
@@ -1746,6 +2472,13 @@ class QbindStore:
                     scope,
                     virtual_id,
                 ),
+            )
+            connection.execute(
+                """
+                DELETE FROM gsk_sync_state
+                WHERE bot_scope = ? AND external_id = ? AND mapping_kind = ?
+                """,
+                (scope, virtual_id, MAPPING_GROUP),
             )
             self._audit_tx(
                 connection,
@@ -1827,6 +2560,13 @@ class QbindStore:
                 WHERE bot_scope = ? AND virtual_group_id = ?
                 """,
                 (GROUP_REVOKED, now, scope, virtual_id),
+            )
+            connection.execute(
+                """
+                DELETE FROM gsk_sync_state
+                WHERE bot_scope = ? AND external_id = ? AND mapping_kind = ?
+                """,
+                (scope, virtual_id, MAPPING_GROUP),
             )
             self._audit_tx(
                 connection,
@@ -2042,6 +2782,74 @@ class QbindStore:
                     ),
                 ).fetchone()
                 return self._email_challenge_from_row(row)
+            finally:
+                connection.close()
+
+    def find_verified_email_challenge(
+        self,
+        *,
+        purpose: str,
+        bot_scope: object,
+        actor_user_id: object,
+        external_user_id: object,
+        candidate_id: object,
+    ) -> Optional[EmailChallenge]:
+        """Return a retry challenge only when the exact source match is unique."""
+
+        challenge_purpose = _normalise(purpose, "purpose")
+        scope = _normalise(bot_scope, "bot_scope")
+        actor = _normalise(actor_user_id, "actor_user_id")
+        user_id = _normalise(external_user_id, "external_user_id")
+        candidate = _normalise(candidate_id, "candidate_id")
+        if actor != user_id:
+            return None
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM email_challenges
+                    WHERE purpose = ? AND bot_scope = ? AND actor_user_id = ?
+                      AND external_user_id = ? AND external_group_id IS NULL
+                      AND candidate_id = ? AND status = ?
+                    """,
+                    (
+                        challenge_purpose,
+                        scope,
+                        actor,
+                        user_id,
+                        candidate,
+                        EMAIL_CHALLENGE_VERIFIED,
+                    ),
+                ).fetchall()
+                if len(rows) != 1:
+                    return None
+                return self._email_challenge_from_row(rows[0])
+            finally:
+                connection.close()
+
+    def list_verified_personal_email_challenges_for_candidate(
+        self, *, bot_scope: object, candidate_id: object
+    ) -> list[EmailChallenge]:
+        """Return every verified personal challenge for an exact candidate key."""
+
+        scope = _normalise(bot_scope, "bot_scope")
+        candidate = _normalise(candidate_id, "candidate_id")
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM email_challenges
+                    WHERE purpose = 'personal_bind' AND bot_scope = ?
+                      AND candidate_id = ? AND status = ?
+                      AND external_group_id IS NULL
+                      AND external_user_id IS NOT NULL
+                    ORDER BY created_at, challenge_id
+                    """,
+                    (scope, candidate, EMAIL_CHALLENGE_VERIFIED),
+                ).fetchall()
+                return [self._email_challenge_from_row(row) for row in rows]
             finally:
                 connection.close()
 
@@ -2589,8 +3397,11 @@ __all__ = [
     "GROUP_VERIFIED",
     "GroupBinding",
     "GroupUserMembership",
+    "GskSyncState",
     "GROUP_DECLARED",
     "LegacyMigrationError",
+    "MAPPING_GROUP",
+    "MAPPING_PERSONAL",
     "MigrationResult",
     "PERSONAL_DECLARED",
     "PERSONAL_REVOKED",

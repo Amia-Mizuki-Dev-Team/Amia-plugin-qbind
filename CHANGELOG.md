@@ -1,44 +1,28 @@
 # Changelog
 
-## QBind / QGroupBind ID routing correction — 2026-10-17
+All notable changes to QBind are documented here.
 
-- Personal and group declarations now persist only in QBind's Bot-scoped SQLite mapping; normal bind/unbind flows no longer treat Gensokyo type=5 acceptance as identity evidence or mutate Gensokyo's isolated ID map.
-- PJSK relay now enforces QBind's personal and group binding gate, resolves both IDs with the current Bot `self_id`, and sends the declared QQ/group IDs to Haruki/Sakura.
-- Backend replies addressed to those declared IDs are routed back through the original event's virtual IDs for OneBot delivery.
-- Unverified declarations remain marked `declared`; they are usable by same-Bot business features but are not an ownership proof.
+## [2026-10-22]
 
-## QBind V2 local development update — 2026-10-16
+### Changed
+- Group business gates now report the specific local blocking state (missing group binding, declared, pending verification, conflict, revoked, or unverified personal identity) instead of one generic GSK synchronization message.
+- type=5 synchronization is state-aware: each successful write is recorded in SQLite (`gsk_sync_state`) and identical repeats are skipped, because Gensokyo rejects a re-write of an existing mapping instead of treating it as a no-op.
 
-### Acceptance matrix follow-up
+### Fixed
+- Declared group bindings no longer point operators at `qgconfirm`/`qgcode`, which cannot succeed while email verification is disabled.
+- Gensokyo's `已存在` (target already mapped) and `不存在` (virtual identity row missing) rejections are distinguished from generic failures: an existing target is accepted as the reached state, with the caveat that Gensokyo echoes the requested value and therefore cannot prove which virtual ID holds it; a missing row gets its own actionable message, and only a possible partial group write is compensated as a conflict.
+- Completing a group binding no longer fails when the personal mapping was already written moments earlier.
+- `set_group_mapping_client` keeps the group verifier on a client that can perform type=11 lookups.
 
-- Added `tests/test_acceptance_matrix.py` for the executable local portions of attachment section 10.1–10.3.
-- Covered personal invalid input, duplicate binding, timeout, cross-user confirmation, canonical conflict, backend failure, restart persistence and recoverable unbind.
-- Covered group operator permissions, invalid group IDs, cross-user/cross-group tokens, concurrent admin requests, verifier rejection, timeout, reuse, unbind and restart persistence.
-- Covered two virtual user IDs sharing one canonical identity only after trusted verification, distinct group identities, and independent group/personal revocation.
-- Fixed the personal canonical uniqueness rule so unverified claims remain exclusive while trusted verification may add a second virtual alias for the same real QQ.
-- Added the normal QGroupBind declaration path: Gensokyo `type=5` writes the virtual-group to real-group mapping just like personal QBind, and a successful request is immediately available to backend group consumers as `declared`. A later trusted or email review can promote it to `verified`.
-- Added a global pre-use access gate: ordinary private-chat business messages require the user's personal binding, while group business messages require both the user's personal binding and the current group's `declared` or `verified` mapping. Binding, status and help commands remain available for recovery.
+## [2026-10-21]
 
 ### Added
+- Emit fixed, identity-free reason codes when personal binding confirmations are rejected for conflicts.
 
-- SQLite-backed personal and group binding storage with Bot `self_id` namespaces.
-- Binding states for declared, verified, pending verification, conflict, revoked and recoverable unbind operations.
-- Atomic audit records with digested identity references rather than plaintext IDs in audit subjects.
-- One-time, expiring confirmation requests bound to Bot, user and group context.
-- Safe import of legacy `binds.json`, rollback backup creation and conflict-preserving migration.
-- `QGroupBind` commands: `qgbind`, `qgconfirm`, `qgcancel`, `qgstatus`, `qgunbind` and `qgrebind`.
-- `GroupIdentityResolver`, `resolve_context_identity()` and trusted verification adapter boundaries.
-- Gensokyo type=5 client for personal and group idmap updates.
-- Optional Gensokyo `type=11` group/user pair client and `GensokyoGroupVerifier` for later trusted review; type=5 remains a usable declaration, not an ownership-proof status.
-
-### Security behavior changes
-
-- A successful Gensokyo type=5 response is stored as `declared`, immediately exposed to backend group consumers, and kept distinct from the later `verified` security-review status.
-- `QbindIdentityResolver` and `get_verified_qq()` never expose an unverified manual QQ number as canonical identity.
-- Personal unbind verifies that the target belongs to the current Bot/user record and retains `unbind_pending` recovery state when the backend is partial or unavailable.
-- Group commands use type=5 for the normal declaration path and never treat it as independent ownership proof; later email/trusted review is represented separately by `verified`.
-- Existing verified group mappings are not automatically overwritten by a new request; rebinds preserve history and require the same operator confirmation flow.
-
-### Verification boundary
-
-The local unittest suite covers storage and resolver behavior. Gensokyo Release015/current production behavior, `use_uin` variants, `idmap_isolation` runtime behavior, trusted QQ/group ownership evidence, Haruki integration and real QQ group acceptance remain `NOT_VERIFIED`/`NOT_RUN` until performed in the target environment.
+### Fixed
+- Allow identical virtual user ID and canonical QQ strings through the normal binding state machine; email-required mode still verifies only after a valid code.
+- Prevent conflicting cross-Bot targets from overwriting the unscoped personal type=5 mapping; include locally resolvable pending bindings in conflict and rollback-reference checks while keeping batch eligibility to declared/verified records.
+- Check all active canonical owners and report personal mapping sync failures safely without leaking identifiers or raising an unbound-variable error.
+- Report personal binding conflicts explicitly instead of showing a generic failed status.
+- Keep email-verification aliases fail-closed: after an exact QQ-mail challenge and explicit type=5 success, create a same-scope verified alias for the candidate key only under the current deployment assumption that the candidate key equals the post-map event key. type=5 success does not prove QQ ownership, and this key equality is not an adapter guarantee: the adapter provides neither mapping readback nor event-identity guarantees. Target conflicts, ambiguous recovery, and failed or unknown remote results never fall back to another key.
+- Restrict QQ-mail sync retries to a unique verified challenge for the original source key; reject ambiguous histories, revoked targets, conflicts, and unknown outcomes without candidate-key recovery.

@@ -1,5 +1,8 @@
 import asyncio
+import atexit
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from dataclasses import replace
@@ -8,6 +11,14 @@ from pathlib import Path
 import nonebot
 
 nonebot.init()
+
+# Importing the plugin initialises its default store as an import side effect,
+# and that store creates/migrates ``<plugin>/data/qbind.sqlite3``.  Redirect
+# the import-time store to a throwaway file so the suite never opens, writes or
+# migrates the real database; each test still selects its own temp directory.
+_IMPORT_STORE_ROOT = Path(tempfile.mkdtemp(prefix="qbind-import-store-"))
+atexit.register(shutil.rmtree, _IMPORT_STORE_ROOT, ignore_errors=True)
+os.environ["QBIND_DB_PATH"] = str(_IMPORT_STORE_ROOT / "qbind.sqlite3")
 
 from standalone_loader import load_core, load_qbind
 

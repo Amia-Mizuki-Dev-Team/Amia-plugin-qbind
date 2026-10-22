@@ -1,6 +1,6 @@
 """Local QQ-mail verification for QBind/QGroupBind.
 
-The bot uses a Feishu mailbox only as the SMTP sender.  The recipient is
+The bot uses a configured SMTP mailbox only as the sender.  The recipient is
 always derived from the already submitted QQ number and is never accepted as
 an arbitrary user-provided address.
 """
@@ -92,7 +92,7 @@ class SMTPConfig:
         username = (_setting("QBIND_SMTP_USER", "") or "").strip()
         password = _setting("QBIND_SMTP_PASSWORD", "") or ""
         return cls(
-            host=(_setting("QBIND_SMTP_HOST", "smtp.feishu.cn") or "").strip(),
+            host=(_setting("QBIND_SMTP_HOST", "smtpdm.aliyun.com") or "").strip(),
             port=int(_setting("QBIND_SMTP_PORT", "465") or "465"),
             use_ssl=_env_bool("QBIND_SMTP_SSL", True),
             username=username,
@@ -182,9 +182,9 @@ def code_digest(challenge_id: str, code: str, secret: str) -> str:
 
 def _purpose_label(purpose: str) -> str:
     return {
-        "personal_bind": "个人 QQ 绑定",
-        "group_bind": "群主 QGroupBind 绑定",
-        "group_rebind": "群主 QGroupBind 换绑",
+        "personal_bind": "身份验证",
+        "group_bind": "身份验证",
+        "group_rebind": "身份验证",
     }.get(str(purpose), "身份绑定")
 
 
@@ -213,7 +213,7 @@ def build_verification_message(
         "如果这是你本人发起的操作，无需其他处理。\n\n"
         "如果不是你本人发起的操作，请忽略此邮件，并检查账号安全。\n\n"
         "此致\n"
-        "Amia_晓山瑞希 | HongXing技术团队\n\n"
+        "Amia_晓山瑞希 验证码\n\n"
         "如有疑问，请联系 Amia 管理员。"
     )
 
@@ -307,7 +307,7 @@ def build_verification_message(
                 </p>
                 <p style="margin:0 0 4px;">此致</p>
                 <p style="margin:0 0 50px;font-weight:700;">
-                  Amia_晓山瑞希 | HongXing技术团队
+                  Amia_晓山瑞希 验证码
                 </p>
                 <p style="{footer_note_style}">
                   如有疑问，请联系 Amia 管理员。
@@ -324,7 +324,7 @@ def build_verification_message(
     message = EmailMessage()
     message["From"] = from_address
     message["To"] = recipient
-    message["Subject"] = "Amia 身份绑定验证码"
+    message["Subject"] = "Amia_晓山瑞希 验证码"
     message.set_content(plain_text)
     message.add_alternative(html_text, subtype="html")
     return message
@@ -355,7 +355,7 @@ class SMTPMailSender:
     def _connect(self):
         """Connect and complete TLS before any message is sent.
 
-        A transient Feishu SMTP/CDN edge timeout is safe to retry here because
+        A transient SMTP/CDN edge timeout is safe to retry here because
         this method has not authenticated or sent the message yet.  The send
         phase below is deliberately not retried, which avoids duplicate codes
         when a server has already accepted a message but the response was lost.

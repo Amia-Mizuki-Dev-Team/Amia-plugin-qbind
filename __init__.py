@@ -28,8 +28,14 @@ from nonebot.consts import CMD_KEY, PREFIX_KEY
 from nonebot.matcher import Matcher
 from nonebot.params import CommandArg, T_State
 from nonebot.plugin import PluginMetadata
+from nonebot.permission import SUPERUSER
 
-from .gensokyo import GensokyoMappingClient
+from .gensokyo import (
+    GensokyoMappingClient,
+    GensokyoMappingError,
+    GensokyoMappingExistsError,
+    GensokyoMappingMissingError,
+)
 from .mail import (
     MailConfigurationError,
     MailDeliveryError,
@@ -40,6 +46,13 @@ from .mail import (
     qq_email,
 )
 from .storage import (
+    GROUP_CONFLICT,
+    GROUP_DECLARED,
+    GROUP_PENDING_VERIFICATION,
+    GROUP_REVOKED,
+    GROUP_VERIFIED,
+    MAPPING_GROUP,
+    MAPPING_PERSONAL,
     PERSONAL_DECLARED,
     PERSONAL_REVOKED,
     PERSONAL_UNBIND_PENDING,
@@ -53,6 +66,8 @@ from .storage import (
     ConfirmationRequest,
     EmailChallenge,
     GroupUserMembership,
+    PersonalBinding,
+    VerifiedPair,
     QbindStorageError,
     QbindStore,
 )
@@ -475,6 +490,14 @@ def get_verified_qq(session_id: object, self_id: Optional[object] = None) -> Opt
     return get_real_qq(session_id, self_id, verified_only=True)
 
 
+def get_verified_pair(
+    self_id: object, user_id: object, group_id: object
+) -> Optional[VerifiedPair]:
+    """Return same-Bot personal/group rows only when both are verified."""
+
+    return get_store().get_verified_pair(self_id, user_id, group_id)
+
+
 def record_verified_membership(
     *,
     self_id: object,
@@ -807,59 +830,259 @@ async def _send_group_bind_prompt_once(event: MessageEvent, bot: Bot) -> bool:
     return True
 
 
-async def ensure_context_bound(event: MessageEvent, bot: Bot) -> bool:
-    """Require the personal binding and, for group events, group binding.
+def _group_status_buttons(*, include_bind: bool = False) -> List[List[Dict[str, Any]]]:
+    row: List[Dict[str, Any]] = []
+    if include_bind:
+        row.append(
+            {
+                "render_data.label": "发起群绑定",
+                "action.data": "qgbind ",
+                "action.enter": False,
+            }
+        )
+    row.append(
+        {
+            "render_data.label": "查看群绑定状态",
+            "action.data": "qgstatus",
+            "action.enter": True,
+        }
+    )
+    return [row]
 
-    This is the shared pre-use gate for business handlers.  In legacy mode,
-    local declaration states remain usable for compatibility.  When
-    ``QBIND_EMAIL_REQUIRED=true`` is enabled, both personal and group checks
-    require the corresponding ``verified`` state.
-    Binding/status/help commands are intentionally outside this helper so a
-    user can recover from an unbound state.
+
+def _group_block_prompt(
+    status: str,
+) -> tuple[str, str, List[List[Dict[str, Any]]]]:
+    """Explain a locally blocking group state.
+
+    Returns the prompt-dedupe kind, the markdown body and its buttons.  Every
+    text is derived from local state only: none of them carries a QQ number, a
+    group number or a virtual ID, and none of them mentions GSK, because no
+    remote write has happened yet in these branches.
     """
 
+    if status == GROUP_DECLARED:
+        return (
+            "group_declared",
+            # Declared rows only exist while email verification is disabled
+            # (group.py promotes to pending_verification otherwise), so qgcode
+            # and qgconfirm cannot help here: say what actually unblocks it.
+            "### 🔒 本群绑定仍是声明状态\n\n"
+            "> 当前部署为本地声明模式，群绑定声明不会放行群业务指令。\n"
+            "> 需要启用 QQ 邮箱认证，或由管理员完成可信审核后，才能放行。\n"
+            "> 可用 `qgstatus` 查看当前群绑定状态。",
+            _group_status_buttons(),
+        )
+    if status == GROUP_PENDING_VERIFICATION:
+        return (
+            "group_pending_verification",
+            "### 🔒 本群绑定等待邮箱验证码\n\n"
+            "> 本群绑定正在等待邮箱验证码，验证完成前群业务指令不会执行。\n"
+            "> 请群主发送 `qgcode <6位验证码>` 完成验证。\n"
+            "> 可用 `qgstatus` 查看当前群绑定状态。",
+            _group_status_buttons(),
+        )
+    if status == GROUP_CONFLICT:
+        return (
+            "group_conflict",
+            "### 🔒 本群绑定存在映射冲突\n\n"
+            "> 本群绑定存在映射冲突，需要管理员对账，本次业务请求未执行。\n"
+            "> 可用 `qgstatus` 查看当前群绑定状态。",
+            _group_status_buttons(),
+        )
+    if status == GROUP_REVOKED:
+        return (
+            "group_revoked",
+            "### 🔒 本群绑定已撤销\n\n"
+            "> 本群绑定已撤销，群业务指令不会执行。\n"
+            "> 如需恢复，请由群主重新发送 `qgbind <真实群号>`。\n"
+            "> 可用 `qgstatus` 查看当前群绑定状态。",
+            _group_status_buttons(include_bind=True),
+        )
+    return (
+        "group_unknown",
+        "### 🔒 本群身份暂不可用\n\n"
+        "> 本群绑定状态未知，群业务请求未执行。\n"
+        "> 可用 `qgstatus` 查看当前群绑定状态。",
+        _group_status_buttons(),
+    )
+
+
+async def _send_group_state_prompt(event: MessageEvent, bot: Bot, status: str) -> bool:
+    kind, content, buttons = _group_block_prompt(status)
+    if not _guard_prompt_is_new(event, kind):
+        return False
+    await bot.send(event, _reply(content, buttons))
+    return True
+
+
+def _personal_block_prompt(
+    status: Optional[str], user_id: str
+) -> tuple[str, str, List[List[Dict[str, Any]]]]:
+    """Explain a locally blocking personal state.
+
+    Like the group prompts these carry no QQ number, group number or virtual
+    ID, and they never mention GSK: a locally unverified personal row blocks
+    before any remote write is attempted, so retrying cannot help.
+    """
+
+    if status == PERSONAL_DECLARED:
+        return (
+            "personal_declared",
+            "### 🔒 个人绑定仍是声明状态\n\n"
+            "> 当前部署为本地声明模式，个人声明不会放行群业务指令。\n"
+            "> 需要启用 QQ 邮箱认证，或由管理员完成可信审核后，才能放行。\n"
+            "> 如需重新确认，可发送 `qbind <你的QQ号>`；持续不可用请联系管理员。",
+            _personal_action_buttons(user_id, include_unbind=False),
+        )
+    if status == PERSONAL_UNBIND_PENDING:
+        return (
+            "personal_unbind_pending",
+            "### ⏳ 个人绑定正在解绑\n\n"
+            "> 解绑处理完成前业务指令不会执行；如需重新绑定请稍后再试。",
+            _personal_action_buttons(user_id, include_unbind=False),
+        )
+    if status is None or status == PERSONAL_REVOKED:
+        return (
+            "personal_unavailable",
+            "### 🔒 个人绑定不可用\n\n"
+            "> 请先发送 `qbind <你的QQ号>` 完成个人绑定。",
+            _personal_action_buttons(user_id, include_unbind=False),
+        )
+    return (
+        "personal_unknown",
+        "### 🔒 个人身份暂不可用\n\n"
+        "> 个人绑定状态未知，业务请求未执行；请稍后重试或联系管理员。",
+        _personal_action_buttons(user_id, include_unbind=False),
+    )
+
+
+async def _send_personal_state_prompt(
+    event: MessageEvent, bot: Bot, status: Optional[str], user_id: str
+) -> bool:
+    kind, content, buttons = _personal_block_prompt(status, user_id)
+    if not _guard_prompt_is_new(event, kind):
+        return False
+    await bot.send(event, _reply(content, buttons))
+    return True
+
+
+async def ensure_context_bound(event: MessageEvent, bot: Bot) -> bool:
+    """Require verified identity and successful GSK sync before business work."""
+
     scope, user_id = _scope_user(event)
-    verified_only = email_verification_required()
-    if not scope or not user_id or not is_bound(
-        user_id, scope, verified_only=verified_only
-    ):
+    if not scope or not user_id:
         await _send_bind_prompt_once(event, bot)
         return False
 
     group_id = getattr(event, "group_id", None)
     if group_id is None or str(group_id).strip() == "":
-        return True
-
-    from .group import get_group_name, get_real_group, is_group_bound
-
-    if is_group_bound(str(group_id), scope, verified_only=verified_only):
-        real_group_id = get_real_group(str(group_id), scope)
-        if real_group_id:
-            group_name = get_group_name(str(group_id), scope)
-            if not group_name:
-                getter = getattr(bot, "get_group_info", None)
-                if callable(getter):
-                    try:
-                        info = await getter(group_id=str(group_id))
-                    except Exception:
-                        logger.debug("unable to query group name for membership archive", exc_info=True)
-                    else:
-                        if isinstance(info, dict) and info.get("group_name"):
-                            group_name = str(info["group_name"]).strip()
-            # The archive is populated only after an explicit Bot command has
-            # passed both gates.  Normal group messages never reach this
-            # helper, and the storage method independently requires both
-            # binding rows to be email/trust verified.
-            await _publish_verified_membership(
-                self_id=scope,
-                group_id=str(group_id),
-                user_id=user_id,
-                group_name=group_name,
+        try:
+            verified_only = email_verification_required()
+            bound = is_bound(user_id, scope, verified_only=verified_only)
+            personal = get_store().get_personal(scope, user_id) if bound else None
+            if personal is not None and personal.binding_status == PERSONAL_VERIFIED:
+                await sync_verified_personal_mapping(scope, user_id)
+        except Exception:
+            logger.exception("QBind personal identity validation failed; blocking business request")
+            await bot.send(
+                event,
+                _reply("### ⚠️ 个人身份暂不可用\n\n> QBind 状态校验或 GSK 映射同步失败，业务请求未执行。"),
             )
+            return False
+        if not bound:
+            await _send_bind_prompt_once(event, bot)
+            return False
         return True
-    await _send_group_bind_prompt_once(event, bot)
-    return False
 
+    group_key = str(group_id).strip()
+    if not is_bound(
+        user_id, scope, verified_only=email_verification_required()
+    ):
+        await _send_bind_prompt_once(event, bot)
+        return False
+    try:
+        group = get_store().get_group(scope, group_key)
+    except Exception:
+        logger.exception("QBind group binding lookup failed; blocking business request")
+        await bot.send(
+            event,
+            _reply(
+                "### ⚠️ 当前群身份暂不可用\n\n> QBind 本地状态校验失败，业务请求未执行。"
+            ),
+        )
+        return False
+    if group is None:
+        await _send_group_bind_prompt_once(event, bot)
+        return False
+    if group.binding_status != GROUP_VERIFIED:
+        # Local state alone already blocks: say which one, and never blame GSK.
+        await _send_group_state_prompt(event, bot, group.binding_status)
+        return False
+
+    try:
+        personal = get_store().get_personal(scope, user_id)
+    except Exception:
+        logger.exception("QBind personal binding lookup failed; blocking business request")
+        await bot.send(
+            event,
+            _reply(
+                "### ⚠️ 当前群身份暂不可用\n\n> QBind 本地状态校验失败，业务请求未执行。"
+            ),
+        )
+        return False
+    if personal is None or personal.binding_status != PERSONAL_VERIFIED:
+        # Reported before the sync: get_verified_pair() needs a verified personal
+        # row, so retrying GSK would never succeed either.
+        await _send_personal_state_prompt(
+            event,
+            bot,
+            None if personal is None else personal.binding_status,
+            user_id,
+        )
+        return False
+
+    try:
+        pair = await sync_verified_pair(scope, user_id, group_key)
+    except Exception:
+        logger.exception("verified pair GSK sync is unavailable; blocking business request")
+        await bot.send(
+            event,
+            _reply(
+                "### 🔒 GSK 映射同步失败\n\n"
+                "> 外部（GSK）身份映射未能明确同步成功，本次业务请求未执行；"
+                "可稍后重试，持续失败请用 `qgstatus` 并提供日志给管理员。",
+                _group_status_buttons(),
+            ),
+        )
+        return False
+
+    group_name = pair.group.group_name
+    if not group_name:
+        getter = getattr(bot, "get_group_info", None)
+        if callable(getter):
+            try:
+                info = await getter(group_id=group_key)
+            except Exception:
+                logger.debug("unable to query group name for membership archive", exc_info=True)
+            else:
+                if isinstance(info, dict) and info.get("group_name"):
+                    group_name = str(info["group_name"]).strip()
+    try:
+        await _publish_verified_membership(
+            self_id=scope,
+            group_id=group_key,
+            user_id=user_id,
+            group_name=group_name,
+        )
+    except Exception:
+        logger.exception("verified membership could not be persisted; blocking business request")
+        await bot.send(
+            event,
+            _reply("### ⚠️ 当前群身份暂不可用\n\n> QBind 本地状态校验失败，业务请求未执行。"),
+        )
+        return False
+    return True
 
 access_guard = on_message(priority=-1, block=False)
 
@@ -877,8 +1100,11 @@ async def access_guard_handler(
         return
     if _is_binding_or_information_command(state):
         return
-    if await ensure_context_bound(event, bot):
-        return
+    try:
+        if await ensure_context_bound(event, bot):
+            return
+    except Exception:
+        logger.exception("QBind access validation failed; stopping business propagation")
     matcher.stop_propagation()
 
 
@@ -889,15 +1115,10 @@ def _validate_qq(value: str) -> Optional[str]:
 
 
 def _build_api_url(session_id: str, real_qq: str) -> str:
-    """Compatibility URL builder for the personal-only type=5 endpoint."""
+    """Compatibility URL builder for one numeric type=5 mapping."""
 
     base = (os.getenv("QBIND_GENSOKYO_API_URL") or "http://127.0.0.1:15630").rstrip("/")
     return f"{base}/getid?{urlencode({'oldRowValue': session_id, 'newRowValue': real_qq, 'type': '5'})}"
-
-
-def _build_unbind_api_url(session_id: str) -> str:
-    base = (os.getenv("QBIND_GENSOKYO_API_URL") or "http://127.0.0.1:15630").rstrip("/")
-    return f"{base}/getid?{urlencode({'oldRowValue': session_id, 'newRowValue': '0', 'type': '5'})}"
 
 
 _mapping_client: Any = GensokyoMappingClient()
@@ -910,6 +1131,15 @@ def set_mapping_client(client: Any) -> None:
         raise TypeError("mapping client must provide personal set/clear methods")
     global _mapping_client
     _mapping_client = client
+    # A client that also owns the group mapping methods becomes the single
+    # seam for both type=5 writes; a personal-only client leaves the group
+    # client untouched, exactly as before.
+    if callable(getattr(client, "set_group_mapping", None)) and callable(
+        getattr(client, "clear_group_mapping", None)
+    ):
+        from .group import set_group_mapping_client
+
+        set_group_mapping_client(client)
 
 
 def _personal_request(
@@ -941,6 +1171,8 @@ def _personal_request(
 
 
 def _request_message(request: ConfirmationRequest) -> str:
+    if request.result_code == "conflict":
+        return "❌ QQ 号绑定冲突：本次个人绑定未完成。请先检查已有绑定或联系管理员处理。"
     if request.result_code == "email_pending":
         return (
             "📨 QQ 邮箱验证码已发送。\n"
@@ -948,11 +1180,11 @@ def _request_message(request: ConfirmationRequest) -> str:
         )
     if request.result_code == "declared":
         return (
-            "✅ QQ 号已保存到当前 Bot 的 QBind 映射并标记为‘已声明’，绑定功能现在可以使用。\n"
-            "⚠️ 这是本人声明，尚未完成所有权核验；后续安全审核可再将状态提升为‘已验证’。"
+            "✅ QQ 号已保存到当前 Bot 的 QBind 本地声明。\n"
+            "⚠️ 尚未完成独立所有权核验，因此不会写入 GSK；只有 verified 状态才会同步映射。"
         )
     if request.result_code == "unbound":
-        return "✅ 个人绑定已解绑，历史审计记录已保留。"
+        return "✅ QBind 本地个人绑定已撤销，历史审计记录已保留；GSK type=5 不提供可靠删除，本地撤销不代表远端映射已清除，需显式对账。"
     if request.result_code == "failed":
         return "❌ QBind 本地状态更新失败，绑定未报告为成功；请稍后重试或联系管理员检查数据库。"
     if request.result_code == "backend_applied_unrecorded":
@@ -969,6 +1201,284 @@ def _request_message(request: ConfirmationRequest) -> str:
 # ---------------------------------------------------------------------------
 # Personal qbind
 # ---------------------------------------------------------------------------
+
+_PERSONAL_MAPPING_CONFLICT = "personal mapping conflicts with active bindings"
+_PERSONAL_MAPPING_WRITE_LOCK = asyncio.Lock()
+
+
+class _PostMappingAliasError(QbindStorageError):
+    """A confirmed remote mapping could not be recorded as a local alias."""
+
+
+def _personal_mapping_conflicts(records: List[Any]) -> Dict[str, set[str]]:
+    targets: Dict[str, set[str]] = {}
+    for record in records:
+        if record.canonical_user_id:
+            targets.setdefault(record.external_user_id, set()).add(
+                record.canonical_user_id
+            )
+    return {
+        external_user_id: canonical_ids
+        for external_user_id, canonical_ids in targets.items()
+        if len(canonical_ids) > 1
+    }
+
+
+def _assert_personal_mapping_consistent(
+    external_user_id: str, canonical_user_id: str
+) -> None:
+    records = get_store().list_locally_resolvable_personal_bindings()
+    if any(
+        record.external_user_id == external_user_id
+        and (
+            not record.canonical_user_id
+            or record.canonical_user_id != canonical_user_id
+        )
+        for record in records
+    ):
+        raise BindingConflictError(_PERSONAL_MAPPING_CONFLICT)
+
+
+async def _set_personal_mapping(
+    external_user_id: str, canonical_user_id: str, *, lock_held: bool = False
+) -> None:
+    async def write_mapping() -> None:
+        _assert_personal_mapping_consistent(external_user_id, canonical_user_id)
+        await _mapping_client.set_personal_mapping(
+            external_user_id, canonical_user_id
+        )
+
+    if lock_held:
+        await write_mapping()
+    else:
+        async with _PERSONAL_MAPPING_WRITE_LOCK:
+            await write_mapping()
+
+
+def _assert_group_mapping_consistent(
+    external_group_id: str, canonical_group_id: str
+) -> None:
+    records = get_store().list_locally_resolvable_group_bindings()
+    if any(
+        record.virtual_group_id == external_group_id
+        and record.real_group_id != canonical_group_id
+        for record in records
+    ):
+        raise BindingConflictError("group mapping conflicts with active Bot bindings")
+
+
+async def sync_verified_personal_mapping(
+    self_id: object, user_id: object
+) -> PersonalBinding:
+    """Synchronize one locally verified personal mapping or fail closed.
+
+    The type=5 write is skipped when SQLite already records the identical
+    write for the live row version: Gensokyo is not idempotent and answers a
+    repeat write with ``已存在``.
+    """
+
+    scope, external_id = str(self_id).strip(), str(user_id).strip()
+    async with _PERSONAL_MAPPING_WRITE_LOCK:
+        store = get_store()
+        record = store.get_personal(scope, external_id)
+        if (
+            record is None
+            or record.binding_status != PERSONAL_VERIFIED
+            or not record.canonical_user_id
+        ):
+            raise QbindStorageError("personal mapping is not locally verified")
+        state = store.get_gsk_sync(scope, external_id, MAPPING_PERSONAL)
+        if (
+            state is not None
+            and state.canonical_id == record.canonical_user_id
+            and state.local_version == record.version
+        ):
+            return record
+        _assert_personal_mapping_consistent(external_id, record.canonical_user_id)
+        try:
+            await _mapping_client.set_personal_mapping(
+                external_id, record.canonical_user_id
+            )
+        except GensokyoMappingExistsError as error:
+            # Gensokyo echoes the value we asked to write, so this proves only
+            # that the target is mapped, not which virtual ID holds it.
+            # Absorbing it is an explicit trade-off: the alternative is failing
+            # every command after our own previous write.  A non-standard body
+            # that reports a different value still fails closed.
+            if (
+                error.remote_value is not None
+                and error.remote_value != record.canonical_user_id
+            ):
+                raise
+            logger.warning(
+                "GSK %s mapping already exists; treating the target state as "
+                "reached (local_version=%s)",
+                MAPPING_PERSONAL,
+                record.version,
+            )
+        except GensokyoMappingError:
+            raise
+        except Exception as error:
+            raise GensokyoMappingError(
+                "personal GSK mapping result is unknown", retryable=True
+            ) from error
+        store.record_gsk_sync(
+            bot_scope=scope,
+            external_id=external_id,
+            mapping_kind=MAPPING_PERSONAL,
+            canonical_id=record.canonical_user_id,
+            local_version=record.version,
+        )
+        current = store.get_personal(scope, external_id)
+        if (
+            current is None
+            or current.binding_status != PERSONAL_VERIFIED
+            or current.canonical_user_id != record.canonical_user_id
+            or current.version != record.version
+        ):
+            raise QbindStorageError("personal binding changed during GSK synchronization")
+        return current
+
+
+async def sync_verified_pair(
+    self_id: object, user_id: object, group_id: object
+) -> VerifiedPair:
+    """Sync both same-Bot verified mappings in order and fail closed on partial writes.
+
+    Each step is skipped when SQLite already records the identical write for
+    the live row version, because a repeated type=5 write of an existing value
+    is rejected by Gensokyo rather than being a no-op.
+    """
+
+    scope = str(self_id).strip()
+    external_user = str(user_id).strip()
+    external_group = str(group_id).strip()
+    async with _PERSONAL_MAPPING_WRITE_LOCK:
+        store = get_store()
+        pair = store.get_verified_pair(scope, external_user, external_group)
+        if pair is None:
+            raise QbindStorageError(
+                "same-Bot personal and group bindings must both be verified"
+            )
+        real_user = pair.personal.canonical_user_id or ""
+        real_group = pair.group.real_group_id or ""
+        _assert_personal_mapping_consistent(external_user, real_user)
+        _assert_group_mapping_consistent(external_group, real_group)
+        from .group import get_group_mapping_client
+
+        group_client = get_group_mapping_client()
+        personal_state = store.get_gsk_sync(scope, external_user, MAPPING_PERSONAL)
+        group_state = store.get_gsk_sync(scope, external_group, MAPPING_GROUP)
+        # Only the group step can leave a remote write partially applied after
+        # this function returns, so compensation keys off that step alone.  A
+        # personal-step failure is a deterministic refusal or a local check and
+        # never warrants pinning the group row to a permanent conflict.
+        partial_risk = False
+        try:
+            if not (
+                personal_state is not None
+                and personal_state.canonical_id == real_user
+                and personal_state.local_version == pair.personal.version
+            ):
+                try:
+                    await _mapping_client.set_personal_mapping(
+                        external_user, real_user
+                    )
+                except GensokyoMappingExistsError as error:
+                    if (
+                        error.remote_value is not None
+                        and error.remote_value != real_user
+                    ):
+                        raise
+                    logger.warning(
+                        "GSK %s mapping already exists; treating the target "
+                        "state as reached (local_version=%s)",
+                        MAPPING_PERSONAL,
+                        pair.personal.version,
+                    )
+                store.record_gsk_sync(
+                    bot_scope=scope,
+                    external_id=external_user,
+                    mapping_kind=MAPPING_PERSONAL,
+                    canonical_id=real_user,
+                    local_version=pair.personal.version,
+                )
+                current = store.get_verified_pair(
+                    scope, external_user, external_group
+                )
+                if (
+                    current is None
+                    or current.personal.version != pair.personal.version
+                    or current.group.version != pair.group.version
+                    or current.personal.canonical_user_id != real_user
+                    or current.group.real_group_id != real_group
+                ):
+                    raise QbindStorageError(
+                        "verified pair changed during GSK synchronization"
+                    )
+            if not (
+                group_state is not None
+                and group_state.canonical_id == real_group
+                and group_state.local_version == pair.group.version
+            ):
+                # From this line on the remote group mapping may be partially
+                # applied, so any later failure must be pinned as a conflict.
+                partial_risk = True
+                try:
+                    await group_client.set_group_mapping(
+                        external_group, real_group
+                    )
+                except GensokyoMappingExistsError as error:
+                    if (
+                        error.remote_value is not None
+                        and error.remote_value != real_group
+                    ):
+                        raise
+                    logger.warning(
+                        "GSK %s mapping already exists; treating the target "
+                        "state as reached (local_version=%s)",
+                        MAPPING_GROUP,
+                        pair.group.version,
+                    )
+                store.record_gsk_sync(
+                    bot_scope=scope,
+                    external_id=external_group,
+                    mapping_kind=MAPPING_GROUP,
+                    canonical_id=real_group,
+                    local_version=pair.group.version,
+                )
+            current = store.get_verified_pair(scope, external_user, external_group)
+            if (
+                current is None
+                or current.personal.version != pair.personal.version
+                or current.group.version != pair.group.version
+            ):
+                raise QbindStorageError("verified pair changed during GSK synchronization")
+            return current
+        except Exception as error:
+            if partial_risk:
+                # No safe compensation exists without type=5 readback or a reliable delete contract.
+                try:
+                    get_store().mark_group_conflict(
+                        bot_scope=scope,
+                        virtual_group_id=external_group,
+                        error=(
+                            "GSK pair synchronization failed or is unknown; "
+                            "explicit reconciliation is required"
+                        ),
+                        expected_version=pair.group.version,
+                    )
+                except Exception:
+                    logger.exception("partial GSK pair failure could not be persisted locally")
+            if isinstance(
+                error, (BindingConflictError, GensokyoMappingError, QbindStorageError)
+            ):
+                raise
+            raise GensokyoMappingError(
+                "GSK verified-pair mapping result is unknown; explicit reconciliation is required",
+                retryable=True,
+            ) from error
+
 
 bind = on_command("qbind", priority=5, block=False)
 
@@ -999,13 +1509,6 @@ async def bind_handler(
                 _personal_action_buttons(user_id, include_unbind=False),
             )
         )
-    if candidate == user_id:
-        await bind.finish(
-            _reply(
-                "### ❌ 绑定失败\n\n> 虚拟用户 ID 与 QQ 号不能因为字符串相同而被视为已验证身份。",
-                _personal_action_buttons(user_id, include_unbind=False),
-            )
-        )
     try:
         current = get_store().get_personal(scope, user_id)
         if current and current.binding_status in {
@@ -1013,11 +1516,50 @@ async def bind_handler(
             PERSONAL_VERIFIED,
             PERSONAL_UNBIND_PENDING,
         }:
+            if (
+                current.canonical_user_id == candidate
+                and current.binding_status == PERSONAL_VERIFIED
+            ):
+                try:
+                    await sync_verified_personal_mapping(scope, user_id)
+                except GensokyoMappingMissingError:
+                    await bind.finish(
+                        _reply(
+                            "### ⚠️ 远端缺少会话身份记录\n\n"
+                            "> Gensokyo 中找不到当前会话对应的虚拟身份记录，可能已随会话或服务重启回收，本次无法建立映射。\n"
+                            "> 请在群内或私聊中正常发送一条消息后再试；持续失败请联系管理员。",
+                            _personal_action_buttons(user_id),
+                        )
+                    )
+                except BindingConflictError:
+                    await bind.finish(
+                        _reply(
+                            "### ❌ 个人映射冲突\n\n"
+                            "> 检测到与当前请求不一致的个人映射，未更新远端或本地身份，请联系管理员对账。",
+                            _personal_action_buttons(user_id),
+                        )
+                    )
+                except (GensokyoMappingError, QbindStorageError):
+                    await bind.finish(
+                        _reply(
+                            "### ❌ GSK 用户映射同步失败\n\n"
+                            "> 当前个人身份未报告同步成功，请稍后重试或联系管理员对账。",
+                            _personal_action_buttons(user_id),
+                        )
+                    )
+                await bind.finish(
+                    _reply(
+                        "### ✅ GSK 用户映射已同步\n\n"
+                        "> 当前个人绑定状态未更改。",
+                        _personal_action_buttons(user_id),
+                    )
+                )
             if current.binding_status == PERSONAL_VERIFIED:
                 await bind.finish(
                     _reply(
                         "### ℹ️ 当前已有个人绑定\n\n"
-                        "> 当前 Bot 下已经存在已验证个人身份。",
+                        "> 当前 Bot 下已经存在已验证个人身份。\n"
+                        "> 如需更换或撤销，请使用渲染的按钮或管理员对账流程。",
                         _personal_action_buttons(user_id),
                     )
                 )
@@ -1026,6 +1568,16 @@ async def bind_handler(
                 and current.binding_status == PERSONAL_DECLARED
                 and current.canonical_user_id == candidate
             ):
+                try:
+                    _assert_personal_mapping_consistent(user_id, candidate)
+                except BindingConflictError:
+                    await bind.finish(
+                        _reply(
+                            "### ❌ 个人映射冲突\n\n"
+                            "> 检测到其他 Bot 的有效个人绑定与当前请求不一致，未更新映射或本地身份。",
+                            _personal_action_buttons(user_id),
+                        )
+                    )
                 try:
                     _, masked = await start_email_challenge(
                         purpose="personal_bind",
@@ -1049,6 +1601,26 @@ async def bind_handler(
                         "> 请发送 `qbindcode <6位验证码>` 完成个人绑定。\n"
                         "> 验证码有效期为 10 分钟。",
                         _personal_email_code_buttons(user_id),
+                    )
+                )
+            if (
+                current.binding_status == PERSONAL_DECLARED
+                and current.canonical_user_id == candidate
+            ):
+                await bind.finish(
+                    _reply(
+                        "### ℹ️ 当前个人身份仍为声明状态\n\n"
+                        "> 声明不会写入 GSK；需要完成邮箱或可信审核并进入 verified 后才可同步。",
+                        _personal_action_buttons(user_id),
+                    )
+                )
+            if current.binding_status == PERSONAL_UNBIND_PENDING:
+                await bind.finish(
+                    _reply(
+                        "### ⏳ 个人绑定正在解绑\n\n"
+                        "> 解绑流程完成前不会创建新的绑定请求。\n"
+                        "> 如需重新绑定，请稍后重试或联系管理员。",
+                        _personal_action_buttons(user_id),
                     )
                 )
             await bind.finish(
@@ -1153,6 +1725,10 @@ async def confirm_handler(
     current = get_store().get_personal(scope, user_id)
     if request.expected_version is not None:
         if current is None or current.version != request.expected_version:
+            logger.warning(
+                "QBind confirmation rejected; "
+                "reason_code=confirm_bind.expected_version_mismatch"
+            )
             failed = get_store().complete_confirmation(
                 request.request_id,
                 result_code="conflict",
@@ -1167,6 +1743,10 @@ async def confirm_handler(
         PERSONAL_VERIFIED,
         PERSONAL_UNBIND_PENDING,
     }:
+        logger.warning(
+            "QBind confirmation rejected; "
+            "reason_code=confirm_bind.active_binding_exists"
+        )
         failed = get_store().complete_confirmation(
             request.request_id,
             result_code="conflict",
@@ -1178,13 +1758,12 @@ async def confirm_handler(
         )
 
     candidate = request.candidate_id or ""
-    existing_owner = get_store().get_personal_by_canonical(scope, candidate)
-    if (
-        existing_owner is not None
-        and existing_owner.external_user_id != user_id
-        and existing_owner.binding_status
-        in {PERSONAL_DECLARED, PERSONAL_VERIFIED, PERSONAL_UNBIND_PENDING}
-    ):
+    existing_owners = get_store().list_active_personal_by_canonical(scope, candidate)
+    if any(owner.external_user_id != user_id for owner in existing_owners):
+        logger.warning(
+            "QBind confirmation rejected; "
+            "reason_code=confirm_bind.canonical_owner_exists"
+        )
         failed = get_store().complete_confirmation(
             request.request_id,
             result_code="conflict",
@@ -1193,6 +1772,26 @@ async def confirm_handler(
         )
         await confirm.finish(
             _reply(_request_message(failed or request), _personal_action_buttons(user_id))
+        )
+    try:
+        _assert_personal_mapping_consistent(user_id, candidate)
+    except BindingConflictError:
+        logger.warning(
+            "QBind confirmation rejected; "
+            "reason_code=confirm_bind.cross_bot_mapping_inconsistent"
+        )
+        failed = get_store().complete_confirmation(
+            request.request_id,
+            result_code="conflict",
+            status=REQUEST_FAILED,
+            error=_PERSONAL_MAPPING_CONFLICT,
+        )
+        await confirm.finish(
+            _reply(
+                "### ❌ QQ 号绑定冲突（个人映射冲突）：本次个人绑定未完成\n\n"
+                "> 检测到其他 Bot 的有效个人绑定与当前请求不一致，未更新映射或本地身份。",
+                _personal_action_buttons(user_id),
+            )
         )
     if email_verification_required():
         try:
@@ -1242,6 +1841,11 @@ async def confirm_handler(
             request.request_id, result_code="declared"
         )
     except (BindingConflictError, QbindStorageError) as error:
+        if isinstance(error, BindingConflictError):
+            logger.warning(
+                "QBind confirmation rejected; "
+                "reason_code=confirm_bind.local_binding_conflict"
+            )
         logger.exception("QBind local mapping save failed")
         failed = get_store().complete_confirmation(
             request.request_id,
@@ -1255,6 +1859,172 @@ async def confirm_handler(
     await confirm.finish(
         _reply(_request_message(completed or request), _personal_action_buttons(user_id))
     )
+
+
+personal_mapping_resync = on_command(
+    "批量重同步用户映射", permission=SUPERUSER, priority=1, block=True
+)
+
+
+@personal_mapping_resync.handle()
+async def handle_personal_mapping_resync(
+    bot: Bot, matcher: Matcher, args: Message = CommandArg()
+) -> None:
+    """Preview by default; append 执行 to perform one explicit serial batch."""
+    execute = str(args).strip() == "执行"
+    try:
+        records = get_store().list_active_personal_bindings()
+        guard_records = get_store().list_locally_resolvable_personal_bindings()
+    except Exception:
+        logger.error("Batch personal mapping resync could not read local records")
+        await matcher.finish("批量重同步未执行：无法读取本地绑定记录。")
+
+    # type=5 has no Bot scope: conflicting targets for a virtual ID are unsafe.
+    conflicts = _personal_mapping_conflicts(guard_records)
+    if conflicts:
+        await matcher.finish(
+            f"批量重同步已中止：发现 {len(conflicts)} 个跨 Bot 映射冲突；未调用远端接口。"
+        )
+
+    eligible_records = [
+        record
+        for record in records
+        if record.canonical_user_id and record.binding_status == PERSONAL_VERIFIED
+    ]
+    unique_pairs = list(dict.fromkeys(
+        (record.bot_scope, record.external_user_id)
+        for record in eligible_records
+    ))
+    skipped = len(eligible_records) - len(unique_pairs)
+    if not execute:
+        await matcher.finish(
+            f"预览：待同步 {len(unique_pairs)} 条个人映射，重复跳过 {skipped} 条。"
+            "确认后发送：批量重同步用户映射 执行。群组映射不受影响。"
+        )
+
+    # Re-read immediately before the first write so preview-time state is never reused.
+    try:
+        records = get_store().list_active_personal_bindings()
+        guard_records = get_store().list_locally_resolvable_personal_bindings()
+    except Exception:
+        logger.error("Batch personal mapping resync revalidation failed")
+        await matcher.finish("批量重同步未执行：重新校验本地记录失败。")
+    conflicts = _personal_mapping_conflicts(guard_records)
+    if conflicts:
+        await matcher.finish(
+            f"批量重同步已中止：重新校验发现 {len(conflicts)} 个映射冲突；未调用远端接口。"
+        )
+    eligible_records = [
+        record
+        for record in records
+        if record.canonical_user_id and record.binding_status == PERSONAL_VERIFIED
+    ]
+    unique_pairs = list(dict.fromkeys(
+        (record.bot_scope, record.external_user_id)
+        for record in eligible_records
+    ))
+    skipped = len(eligible_records) - len(unique_pairs)
+    succeeded = failed = 0
+    for scope, virtual_user_id in unique_pairs:
+        try:
+            await sync_verified_personal_mapping(scope, virtual_user_id)
+            succeeded += 1
+        except Exception:
+            failed += 1
+            logger.error("Batch personal mapping resync record failed")
+    await matcher.finish(
+        f"批量重同步完成：成功 {succeeded} 条，失败 {failed} 条，重复跳过 {skipped} 条。"
+        + ("失败项未自动重试，请管理员评估后再决定。" if failed else "")
+    )
+
+
+async def _finalize_personal_email_binding(
+    scope: str,
+    user_id: str,
+    candidate: str,
+    challenge_id: str,
+    *,
+    verified_retry: bool,
+):
+    async with _PERSONAL_MAPPING_WRITE_LOCK:
+        current = get_store().get_personal(scope, user_id)
+        if verified_retry:
+            if (
+                current is None
+                or current.binding_status != PERSONAL_VERIFIED
+                or current.canonical_user_id != candidate
+            ):
+                raise QbindStorageError(
+                    "verified email retry source is no longer a matching verified binding"
+                )
+        else:
+            if current is None or current.binding_status == PERSONAL_REVOKED:
+                current = get_store().declare_personal(
+                    bot_scope=scope,
+                    external_user_id=user_id,
+                    canonical_user_id=candidate,
+                    bound_by_user_id=user_id,
+                    verification_source="qbind:qq_email",
+                    operation_id=challenge_id,
+                    allow_verified_canonical_reuse=True,
+                )
+            elif current.canonical_user_id != candidate:
+                raise BindingConflictError(
+                    "current personal QQ differs from email challenge"
+                )
+            if current.binding_status not in {PERSONAL_DECLARED, PERSONAL_VERIFIED}:
+                raise QbindStorageError(
+                    f"personal binding cannot be email-verified from {current.binding_status}"
+                )
+
+        if current is None or current.canonical_user_id != candidate:
+            raise QbindStorageError(
+                "personal binding differs from the email challenge candidate"
+            )
+
+        # The exact QQ-mail challenge is the ownership proof; type=5 success is not.
+        await _set_personal_mapping(user_id, candidate, lock_held=True)
+        if current.binding_status == PERSONAL_DECLARED:
+            verified = get_store().verify_personal(
+                bot_scope=scope,
+                external_user_id=user_id,
+                verified_by=user_id,
+                verification_source="qbind:qq_email",
+                operation_id=challenge_id,
+            )
+        else:
+            verified = current
+
+        source_expected_version = verified.version
+        get_store().assert_verified_personal_alias_available(
+            bot_scope=scope,
+            external_user_id=candidate,
+            canonical_user_id=candidate,
+            source_external_user_id=user_id,
+            email_challenge_id=challenge_id,
+            source_expected_version=source_expected_version,
+            require_unique_challenge=verified_retry,
+            reject_revoked_target=True,
+        )
+        try:
+            return get_store().link_verified_personal(
+                bot_scope=scope,
+                external_user_id=candidate,
+                canonical_user_id=candidate,
+                bound_by_user_id=user_id,
+                verified_by=user_id,
+                verification_source="qbind:qq_email_alias",
+                operation_id=challenge_id,
+                source_external_user_id=user_id,
+                email_challenge_id=challenge_id,
+                source_expected_version=source_expected_version,
+                require_unique_challenge=verified_retry,
+                reject_revoked_target=True,
+            )
+        except Exception as error:
+            raise _PostMappingAliasError(
+                "Gensokyo mapping succeeded but local alias persistence failed"
+            ) from error
 
 
 qbindcode = on_command("qbindcode", priority=5, block=False)
@@ -1272,14 +2042,6 @@ async def qbindcode_handler(
                 "> 当前部署仍使用本地声明模式；管理员可配置 `QBIND_EMAIL_REQUIRED=true` 后启用邮箱认证。"
             )
         )
-    wait = _check_rate_limit(f"email:{scope}:{user_id}")
-    if wait:
-        await qbindcode.finish(
-            _reply(
-                f"### ⏱ 操作过于频繁\n\n> 请 {wait} 秒后再试。",
-                _personal_email_code_buttons(user_id),
-            )
-        )
     code = arg.extract_plain_text().strip()
     if not re.fullmatch(r"\d{6}", code):
         await qbindcode.finish(
@@ -1288,12 +2050,31 @@ async def qbindcode_handler(
                 _personal_email_code_buttons(user_id),
             )
         )
+    current = get_store().get_personal(scope, user_id)
     challenge = get_store().find_email_challenge(
         purpose="personal_bind",
         bot_scope=scope,
         actor_user_id=user_id,
         external_user_id=user_id,
     )
+    if (
+        challenge is None
+        and current is not None
+        and current.binding_status == PERSONAL_VERIFIED
+        and current.canonical_user_id
+    ):
+        retry_challenge = get_store().find_verified_email_challenge(
+            purpose="personal_bind",
+            bot_scope=scope,
+            actor_user_id=user_id,
+            external_user_id=user_id,
+            candidate_id=current.canonical_user_id,
+        )
+        if (
+            retry_challenge is not None
+            and retry_challenge.candidate_id == current.canonical_user_id
+        ):
+            challenge = retry_challenge
     if challenge is None:
         await qbindcode.finish(
             _reply(
@@ -1302,11 +2083,46 @@ async def qbindcode_handler(
                 _personal_action_buttons(user_id, include_unbind=False),
             )
         )
-    attempt = get_store().verify_email_challenge(
-        challenge.challenge_id,
-        code_digest(challenge.challenge_id, code, _email_service.config.code_secret),
+    candidate = challenge.candidate_id
+    if not candidate or _validate_qq(candidate) is not None:
+        await qbindcode.finish(
+            _reply(
+                "### ❌ QQ 邮箱认证请求无效\n\n"
+                "> 认证请求缺少可验证的 QQ 候选，未更新绑定或映射。",
+                _personal_action_buttons(user_id, include_unbind=False),
+            )
+        )
+    verified_retry = (
+        challenge.status == "verified"
+        and current is not None
+        and current.binding_status == PERSONAL_VERIFIED
+        and current.canonical_user_id == candidate
     )
-    if not attempt.accepted:
+    if challenge.status == "verified" and not verified_retry:
+        await qbindcode.finish(
+            _reply(
+                "### ❌ 已验证请求不能用于当前身份\n\n"
+                "> 请先发送 `qbind <你的QQ号>` 获取新的邮箱验证码；历史请求不会重建事件别名。",
+                _personal_action_buttons(user_id, include_unbind=False),
+            )
+        )
+    if not verified_retry:
+        wait = _check_rate_limit(f"email:{scope}:{user_id}")
+        if wait:
+            await qbindcode.finish(
+                _reply(
+                    f"### ⏱ 操作过于频繁\n\n> 请 {wait} 秒后再试。",
+                    _personal_email_code_buttons(user_id),
+                )
+            )
+    if verified_retry:
+        attempt = None
+    else:
+        attempt = get_store().verify_email_challenge(
+            challenge.challenge_id,
+            code_digest(challenge.challenge_id, code, _email_service.config.code_secret),
+        )
+    if attempt is not None and not attempt.accepted:
         message = {
             "invalid_code": "验证码不正确，请检查邮件后重试。",
             "max_attempts": "验证码尝试次数已用完，请重新发起绑定。",
@@ -1320,70 +2136,58 @@ async def qbindcode_handler(
             )
         )
 
-    candidate = challenge.candidate_id or ""
-    current = get_store().get_personal(scope, user_id)
-    existing_owner = get_store().get_personal_by_canonical(scope, candidate)
-    if (
-        existing_owner is not None
-        and existing_owner.external_user_id != user_id
-        and existing_owner.binding_status
-        in {PERSONAL_DECLARED, PERSONAL_VERIFIED, PERSONAL_UNBIND_PENDING}
-    ):
+
+    try:
+        verified = await _finalize_personal_email_binding(
+            scope, user_id, candidate, challenge.challenge_id,
+            verified_retry=verified_retry,
+        )
+    except _PostMappingAliasError:
+        logger.exception("Personal email mapping succeeded but alias persistence failed")
         await qbindcode.finish(
             _reply(
-                "### ❌ QQ 号绑定冲突\n\n> 这个 QQ 号已经属于其他用户，未覆盖原有身份。",
+                "### ⚠️ GSK 映射已确认，但本地事件别名未保存\n\n"
+                "> 为保持安全，当前事件身份尚未放行；请联系管理员恢复，系统不会自动回退或清除映射。",
                 _personal_action_buttons(user_id, include_unbind=False),
             )
         )
-    if current and current.binding_status == PERSONAL_VERIFIED:
-        if current.canonical_user_id != candidate:
-            await qbindcode.finish(
-                _reply(
-                    "### ❌ 个人绑定已发生变化\n\n> 当前用户已经有其他已验证 QQ 号，未覆盖原有身份。",
-                    _personal_action_buttons(user_id),
-                )
-            )
+    except BindingConflictError:
         await qbindcode.finish(
             _reply(
-                "### ✅ QQ 邮箱验证已完成\n\n> 当前个人绑定已经是已验证状态。",
-                _personal_action_buttons(user_id),
+                "### ❌ 个人映射冲突\n\n"
+                "> 检测到其他 Bot 的有效个人绑定与当前请求不一致，未保存或同步当前绑定。",
+                _personal_action_buttons(user_id, include_unbind=False),
             )
         )
-    try:
-        if current is None or current.binding_status == PERSONAL_REVOKED:
-            get_store().declare_personal(
-                bot_scope=scope,
-                external_user_id=user_id,
-                canonical_user_id=candidate,
-                bound_by_user_id=user_id,
-                verification_source="qbind:qq_email",
-                operation_id=challenge.challenge_id,
-            )
-        elif current.binding_status == PERSONAL_DECLARED:
-            if current.canonical_user_id != candidate:
-                raise BindingConflictError("current personal QQ differs from email challenge")
-        else:
-            raise QbindStorageError(
-                f"personal binding cannot be email-verified from {current.binding_status}"
-            )
-        verified = get_store().verify_personal(
-            bot_scope=scope,
-            external_user_id=user_id,
-            verified_by=user_id,
-            verification_source="qbind:qq_email",
-            operation_id=challenge.challenge_id,
-        )
-    except (BindingConflictError, QbindStorageError) as error:
+    except QbindStorageError as error:
         logger.exception("QQ email verification could not finalize personal binding")
         await qbindcode.finish(
             _reply(
-                f"### ❌ QQ 邮箱已验证，但本地绑定保存失败\n\n> {error}",
+                "### ❌ 邮箱验证未完成\n\n> 本地绑定尚未完成验证；请稍后重试或联系管理员。",
+                _personal_action_buttons(user_id, include_unbind=False),
+            )
+        )
+    except GensokyoMappingError:
+        logger.error("Personal mapping sync after email verification failed")
+        await qbindcode.finish(
+            _reply(
+                "### ⚠️ GSK 同步失败\n\n"
+                "> 本次绑定未报告成功；尚未完成本地 verified 状态转换，远端结果可能未知，请稍后重试或联系管理员对账。",
+                _personal_action_buttons(user_id),
+            )
+        )
+    except Exception:
+        logger.exception("Personal email binding finalization failed unexpectedly")
+        await qbindcode.finish(
+            _reply(
+                "### ⚠️ 绑定状态未知\n\n"
+                "> 本次操作未报告成功；请联系管理员核对 QBind 与 GSK 状态后再重试。",
                 _personal_action_buttons(user_id, include_unbind=False),
             )
         )
     await qbindcode.finish(
         _reply(
-            "### ✅ 个人 QQ 绑定已完成邮箱认证\n\n"
+            "### ✅ 个人 QQ 绑定已完成邮箱认证并同步至 GSK\n\n"
             f"> 已验证 QQ：`{verified.canonical_user_id}`\n"
             "> 后续群绑定必须由这个 QQ 对应的群主/管理员邮箱完成。",
             _personal_action_buttons(user_id),
@@ -1662,11 +2466,10 @@ async def resolve_context_identity(
     """Resolve user and optional group IDs in one call.
 
     The personal canonical field is ``None`` unless independently verified.
-    A group canonical mapping is returned after a successful ``qgconfirm``
-    declaration so backend group features can behave like personal QBind;
-    ``group_verification_status`` still distinguishes ``declared`` from the
-    later ``verified`` security-review state.  Unknown IDs are never inferred
-    from names, number ranges, group names, or values in another Bot namespace.
+    In group context, both same-Bot personal and group bindings must be
+    verified before either canonical ID is returned; a declaration alone is
+    not sufficient.  Unknown IDs are never inferred from names, number ranges,
+    group names, or values in another Bot namespace.
     """
 
     resolver = QbindIdentityResolver()
@@ -1707,7 +2510,10 @@ __all__ = [
     "get_real_qq",
     "get_store",
     "get_user_groups",
+    "get_verified_pair",
     "get_verified_qq",
+    "sync_verified_pair",
+    "sync_verified_personal_mapping",
     "is_bound",
     "is_group_bound",
     "record_verified_membership",

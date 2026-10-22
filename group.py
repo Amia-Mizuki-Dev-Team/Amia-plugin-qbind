@@ -50,10 +50,9 @@ _GROUP_REQUEST_TTL = 300.0
 class GroupIdentityResolution:
     """Return the usable real-group mapping plus its review status.
 
-    ``canonical_group_id`` is populated for both ``declared`` and
-    ``verified`` mappings so backend group features can use a successful
-    QGroupBind declaration.  ``verified`` remains a separate signal for the
-    later security/email review.
+    ``canonical_group_id`` is populated only for a locally verified mapping.
+    Group business operations additionally require the same-Bot verified user
+    record and an explicit successful GSK pair synchronization.
     """
 
     bot_scope: str
@@ -108,15 +107,7 @@ class _UnavailableGroupVerifier:
 
 
 class GensokyoGroupVerifier:
-    """Declare locally and optionally verify through Gensokyo's pair lookup.
-
-    Type=11 resolves ``virtual_group_id + virtual_user_id`` to the real group
-    and real user pair.  The pair is the group verification source, so a
-    personal QBind record is not a prerequisite for the first group binding.
-    If the requester already has an independently verified personal record,
-    the returned real user must agree with it as an additional consistency
-    check; a group role alone cannot prove the typed real group number.
-    """
+    """Use type=11 only to reject inconsistent mappings, never to verify."""
 
     def __init__(self, client: Optional[GensokyoMappingClient] = None):
         self.client = client or GensokyoMappingClient()
@@ -124,12 +115,8 @@ class GensokyoGroupVerifier:
     async def declare(
         self, context: GroupVerificationContext, bot: Bot
     ) -> GroupVerificationResult:
-        """Save a declaration locally; do not mutate Gensokyo's ID map.
+        """Save a local declaration without changing Gensokyo's ID map."""
 
-        Gensokyo type=5 only acknowledges an ID-map update and is not evidence
-        that the submitted number is a real QQ group. QGroupBind's local record
-        is what downstream consumers resolve until a trusted review is added.
-        """
         return GroupVerificationResult(
             status="declared",
             source="qgroupbind:declared",
@@ -150,24 +137,25 @@ class GensokyoGroupVerifier:
         except GensokyoMappingError as error:
             return GroupVerificationResult(
                 status="pending",
-                source="gensokyo:type11",
+                source="gensokyo:type11:consistency_only",
                 reason=str(error),
             )
         if resolved.real_group_id != context.requested_real_group_id:
             return GroupVerificationResult(
                 status="rejected",
-                source="gensokyo:type11",
-                reason="type=11 返回的真实群号与申请不一致",
+                source="gensokyo:type11:consistency_only",
+                reason="type=11 returned a group value inconsistent with the request",
             )
         if verified_user_id and resolved.real_user_id != verified_user_id:
             return GroupVerificationResult(
                 status="rejected",
-                source="gensokyo:type11",
-                reason="type=11 返回的真实用户与申请人个人身份不一致",
+                source="gensokyo:type11:consistency_only",
+                reason="type=11 returned a user value inconsistent with QBind",
             )
         return GroupVerificationResult(
-            status="verified",
-            source="gensokyo:type11",
+            status="pending",
+            source="gensokyo:type11:consistency_only",
+            reason="type=11 is a consistency lookup, not ownership proof",
         )
 
 
@@ -191,7 +179,7 @@ def get_group_verifier() -> GroupVerificationAdapter:
 
 
 def set_group_mapping_client(client: Any) -> None:
-    """Replace the backend client used by declaration and unbind flows."""
+    """Replace the client used for verified group type=5 mapping writes."""
 
     if not callable(getattr(client, "set_group_mapping", None)) or not callable(
         getattr(client, "clear_group_mapping", None)
@@ -201,7 +189,11 @@ def set_group_mapping_client(client: Any) -> None:
         )
     global _group_mapping_client
     _group_mapping_client = client
-    if isinstance(_group_verifier, GensokyoGroupVerifier):
+    # Only a client that can read type=11 may serve the verifier; a write-only
+    # fake would otherwise break the verifier with an AttributeError mid-qgconfirm.
+    if isinstance(_group_verifier, GensokyoGroupVerifier) and callable(
+        getattr(client, "resolve_group_user", None)
+    ):
         _group_verifier.client = client
 
 
@@ -459,17 +451,19 @@ def _request_result_message(request: ConfirmationRequest) -> str:
         )
     if request.result_code == "declared":
         return (
-            "✅ 真实群号已保存到当前 Bot 的 QGroupBind 映射，后台现在可以读取。\n"
-            "⚠️ 当前为群主/管理员声明，尚未独立核验；后续邮箱审核可再提升为‘已验证’。"
+            "✅ 真实群号已保存到当前 Bot 的 QGroupBind 本地声明。\n"
+            "⚠️ 声明不会写入 GSK，也不会放行群业务；需要可信验证并完成同 Bot 双 verified 映射同步。"
         )
     if request.result_code == "verified":
-        return "✅ 该群绑定请求已经完成，当前群映射已验证。"
+        return "✅ QBind 本地群绑定已验证；GSK 映射仍须等待同 Bot 个人绑定 verified 后成对同步。"
+    if request.result_code == "verified_synced":
+        return "✅ 群绑定已验证，个人与群 GSK type=5 映射均已明确同步。"
     if request.result_code == "pending_verification":
         return "⏳ 请求已记录，但真实群号仍待可信来源审核；当前不会向其他插件提供该群号。"
     if request.result_code == "conflict":
         return "⚠️ 该请求已进入冲突状态，没有覆盖已有群映射。"
     if request.result_code == "revoked":
-        return "✅ 当前群绑定已撤销。"
+        return "✅ QBind 本地群绑定已撤销；GSK type=5 不提供可靠删除，远端映射需显式对账。"
     if request.result_code == "failed":
         return "❌ QGroupBind 本地状态更新失败，未报告为成功；请稍后重试或联系管理员检查数据库。"
     if request.result_code == "backend_applied_unrecorded":
@@ -489,7 +483,7 @@ def _resolve_group(scope: str, group_id: str) -> GroupIdentityResolution:
         return GroupIdentityResolution(scope, group_id, None, "unbound", "no binding")
     canonical = (
         record.real_group_id
-        if record.binding_status in {GROUP_DECLARED, GROUP_VERIFIED}
+        if record.binding_status == GROUP_VERIFIED
         else None
     )
     return GroupIdentityResolution(
@@ -505,13 +499,13 @@ def get_real_group(
     virtual_group_id: object,
     self_id: Optional[object] = None,
     *,
-    verified_only: bool = False,
+    verified_only: bool = True,
 ) -> Optional[str]:
-    """Return the declared/verified group number for one Bot namespace.
+    """Return a verified group number for one Bot namespace.
 
-    Pass ``verified_only=True`` when a caller needs a trusted canonical group
-    identity.  The default mirrors :func:`qbind.get_real_qq`; it allows normal
-    group-bound features to use the confirmed declaration.
+    ``verified_only`` remains for call compatibility; declarations are never
+    returned. Group operations still require paired identity through
+    :func:`qbind.sync_verified_pair`.
     """
 
     if self_id is None:
@@ -519,12 +513,8 @@ def get_real_group(
     record = _store().get_group(str(self_id), str(virtual_group_id))
     if record is None:
         return None
-    if verified_only and record.binding_status != GROUP_VERIFIED:
-        return None
-    if record.binding_status not in {
-        GROUP_VERIFIED,
-        GROUP_DECLARED,
-    }:
+    # Declarations are never exposed as group identities, even to legacy callers.
+    if record.binding_status != GROUP_VERIFIED:
         return None
     return record.real_group_id
 
@@ -546,7 +536,7 @@ def is_group_bound(
     virtual_group_id: object,
     self_id: Optional[object] = None,
     *,
-    verified_only: bool = False,
+    verified_only: bool = True,
 ) -> bool:
     return get_real_group(
         virtual_group_id, self_id, verified_only=verified_only
@@ -576,10 +566,7 @@ class GroupIdentityResolver:
     async def get_real_group(
         self, self_id: object, virtual_group_id: object
     ) -> Optional[str]:
-        # Match personal QBind's normal compatibility resolver: a local
-        # declaration is available to same-Bot backend consumers. Callers that
-        # require the later security review can use verified_only=True.
-        return get_real_group(virtual_group_id, self_id)
+        return get_real_group(virtual_group_id, self_id, verified_only=True)
 
 
 async def ensure_group_bound(event: Any, bot: Bot) -> bool:
@@ -587,19 +574,21 @@ async def ensure_group_bound(event: Any, bot: Bot) -> bool:
     if context is None:
         return False
     scope, user_id, group_id = context
-    if is_group_bound(group_id, scope):
-        return True
-    await bot.send(
-        event,
-        _message(
-            "### 🔒 当前群还没有完成 QGroupBind\n\n"
-            "> 请由群主/管理员发起 `qgbind <真实群号>` 并确认。\n"
-            "> 确认后后台会读取该声明群号，后续所有权审核另行完成。",
-            _group_action_buttons(include_bind=True),
-        ),
-    )
-    return False
+    from . import sync_verified_pair
 
+    try:
+        await sync_verified_pair(scope, user_id, group_id)
+    except Exception:
+        logger.warning("verified personal/group GSK pair is unavailable")
+        await bot.send(
+            event,
+            _message(
+                "### 🔒 当前群身份暂不可用\n\n"
+                "> 当前 Bot 下个人与群绑定必须都为 verified，且两项 GSK 映射均明确同步成功；本次业务请求未执行。"
+            ),
+        )
+        return False
+    return True
 
 async def approve_group_binding(
     *,
@@ -844,8 +833,21 @@ async def _confirm_group_bind(
                 allow_replace=request.request_kind == "group_rebind",
                 expected_version=request.expected_version,
             )
+            from . import sync_verified_pair
+
+            try:
+                await sync_verified_pair(scope, user_id, group_id)
+            except Exception:
+                logger.exception("verified group mapping could not be synchronized")
+                failed = store.complete_confirmation(
+                    request.request_id,
+                    result_code="failed",
+                    status=REQUEST_FAILED,
+                    error="verified GSK pair synchronization failed or is unknown",
+                )
+                return _request_result_message(failed or request)
             completed = store.complete_confirmation(
-                request.request_id, result_code="verified"
+                request.request_id, result_code="verified_synced"
             )
             return _request_result_message(completed or request)
 
@@ -891,23 +893,17 @@ async def _confirm_group_bind(
                 GROUP_VERIFIED,
                 GROUP_DECLARED,
             }:
-                try:
-                    store.set_group_pending(
-                        bot_scope=scope,
-                        virtual_group_id=group_id,
-                        real_group_id=candidate,
-                        group_name=request.group_name,
-                        bound_by_user_id=user_id,
-                        verification_source=result.source,
-                        operation_id=request.request_id,
-                    )
-                except BindingConflictError:
-                    pass
-                store.mark_group_conflict(
+                store.mark_group_conflict_from_verification(
                     bot_scope=scope,
                     virtual_group_id=group_id,
+                    real_group_id=candidate,
+                    group_name=request.group_name,
+                    bound_by_user_id=user_id,
+                    verification_source=result.source,
                     error=result.reason or result.status,
                     operation_id=request.request_id,
+                    expected_version=current.version if current is not None else None,
+                    expected_absent=current is None,
                 )
             completed = store.complete_confirmation(
                 request.request_id,
@@ -1051,8 +1047,8 @@ async def qgbind_handler(
             f"> 当前虚拟群：`{group_id}`\n"
             f"> 当前群名称：`{group_name or '未读取到'}`\n"
             f"> 待绑定真实群号：`{candidate}`\n\n"
-            "> 确认后会把群号保存到当前 Bot 的 QGroupBind 映射并启用群绑定门禁。"
-            "后台会按该声明读取真实群号；后续邮箱审核可再提升为已验证。\n"
+            "> 确认后只会保存 QBind 本地声明；声明不会写入 GSK 或放行群业务。"
+            "群业务需要当前 Bot 下个人与群都 verified，并完成两次 type=5 同步。\n"
             "> ⏰ 请求五分钟内有效。",
             [
                 [
@@ -1387,7 +1383,19 @@ async def qgcode_handler(
                 _group_action_buttons(include_status=True, include_bind=True),
             )
         )
-    from . import _publish_verified_membership
+    from . import _publish_verified_membership, sync_verified_pair
+
+    try:
+        await sync_verified_pair(scope, user_id, group_id)
+    except Exception:
+        logger.exception("group QQ verification succeeded but GSK pair sync failed")
+        await qgcode.finish(
+            _message(
+                "### ⚠️ 群邮箱已验证，但 GSK 成对映射同步失败\n\n"
+                "> 群业务已阻断，远端结果可能未知；请管理员显式对账后再恢复。",
+                _group_action_buttons(include_status=True, include_bind=True),
+            )
+        )
 
     await _publish_verified_membership(
         self_id=scope,
@@ -1400,7 +1408,7 @@ async def qgcode_handler(
         _message(
             "### ✅ 群主 QQ 邮箱认证完成\n\n"
             f"> 当前群：**{verified.group_name or '当前群'}**\n"
-            "> QGroupBind 已完成，群业务现在可以使用。",
+            "> 当前 Bot 下个人与群 verified 映射已同步；其他用户仍须完成个人 verified 绑定。",
             _group_action_buttons(include_status=True, include_rebind=True, include_unbind=True),
         )
     )
@@ -1654,8 +1662,8 @@ async def qgunbind_handler(event: GroupMessageEvent, arg: Message = CommandArg()
     completed = _store().complete_confirmation(request.request_id, result_code="revoked")
     await qgunbind.finish(
         _message(
-            f"✅ 当前群映射已撤销（版本 {revoked.version}）。\n"
-            "群绑定历史已保留；成员个人身份未受影响。"
+            f"✅ QBind 本地群绑定已撤销（版本 {revoked.version}）。\n"
+            "GSK type=5 不提供可靠删除，远端映射需显式对账；群绑定历史已保留，成员个人身份未受影响。"
             + (f"\n{_request_result_message(completed)}" if completed else ""),
             _group_action_buttons(include_status=True, include_bind=True),
         )

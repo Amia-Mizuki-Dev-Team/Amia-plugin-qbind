@@ -11,7 +11,11 @@ _core = require("amia_core")
 UserIdentityKey = _core.UserIdentityKey
 ResolvedIdentity = _core.ResolvedIdentity
 
-from . import get_binding_status, get_verified_qq
+from . import (
+    get_binding_status,
+    get_verified_qq,
+    get_verified_pair,
+)
 
 
 @dataclass(frozen=True)
@@ -30,7 +34,7 @@ class UserIdentityResolution:
 
 
 class QbindIdentityResolver:
-    """Resolve only verified QBind identities into amia-core canonical IDs."""
+    """Resolve verified QBind identities from local state without GSK writes."""
 
     async def resolve_user_identity(self, key: UserIdentityKey) -> UserIdentityResolution:
         self_id = str(key.self_id)
@@ -62,22 +66,46 @@ class QbindIdentityResolver:
         user_id: object,
         group_id: Optional[object] = None,
     ):
-        from .group import resolve_group_identity
+        scope = str(self_id)
+        external_user = str(user_id)
+        if group_id is None:
+            user = await self.resolve_user_identity(
+                UserIdentityKey(self_id=scope, user_id=external_user)
+            )
+            return {
+                "bot_scope": scope,
+                "external_user_id": external_user,
+                "canonical_user_id": user.canonical_user_id,
+                "user_verification_status": user.verification_status,
+                "external_group_id": None,
+                "canonical_group_id": None,
+                "group_verification_status": None,
+            }
 
-        user = await self.resolve_user_identity(
-            UserIdentityKey(self_id=str(self_id), user_id=str(user_id))
-        )
-        group = None
-        if group_id is not None:
-            group = await resolve_group_identity(str(self_id), str(group_id))
+        external_group = str(group_id)
+        from .group import get_group_binding_status
+
+        user_status = get_binding_status(external_user, scope)
+        group_status = get_group_binding_status(external_group, scope)
+        pair = get_verified_pair(scope, external_user, external_group)
+        if pair is None:
+            return {
+                "bot_scope": scope,
+                "external_user_id": external_user,
+                "canonical_user_id": None,
+                "user_verification_status": user_status,
+                "external_group_id": external_group,
+                "canonical_group_id": None,
+                "group_verification_status": group_status,
+            }
         return {
-            "bot_scope": str(self_id),
-            "external_user_id": str(user_id),
-            "canonical_user_id": user.canonical_user_id,
-            "user_verification_status": user.verification_status,
-            "external_group_id": str(group_id) if group_id is not None else None,
-            "canonical_group_id": group.canonical_group_id if group else None,
-            "group_verification_status": group.verification_status if group else None,
+            "bot_scope": scope,
+            "external_user_id": external_user,
+            "canonical_user_id": pair.personal.canonical_user_id,
+            "user_verification_status": pair.personal.binding_status,
+            "external_group_id": external_group,
+            "canonical_group_id": pair.group.real_group_id,
+            "group_verification_status": pair.group.binding_status,
         }
 
 

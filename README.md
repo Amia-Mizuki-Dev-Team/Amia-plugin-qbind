@@ -6,11 +6,15 @@ QBind 是 Amia 插件生态唯一的个人/群组身份绑定边界。它负责�
 
 ## 重要信任边界
 
-- Gensokyo `getid?type=5` 的实际语义是调用 `UpdateVirtualValue(oldRowValue, newRowValue)` 更新虚拟 idmap 行；HTTP 成功只说明后端接受了这次更新，不证明用户拥有手填的 QQ 号。
+- Gensokyo `getid?type=5` 调用 `UpdateVirtualValue(oldRowValue, newRowValue)`：`oldRowValue` 是虚拟 user ID，`newRowValue` 是 canonical QQ。HTTP 成功只说明后端接受了映射更新，不证明用户拥有该 QQ 号。个人确认和同 QQ 的 QBind 重同步会调用此接口；SUPERUSER 可用 `批量重同步用户映射` 对当前生效的个人记录进行批量同步。
 - 因此未启用邮箱模式时，个人确认后的记录状态仍是 `declared`，兼容后台可通过 `get_real_qq(user_id, self_id)` 使用该声明值；启用 `QBIND_EMAIL_REQUIRED=true` 后，`qbindcode` 会把声明提升为 `verified`，普通业务门禁也只接受 `verified`。`QbindIdentityResolver` 只把已验证个人身份作为 `canonical_user_id` 返回；跨群共享等高信任功能仍应要求 `verified`。
 - 群内确认只能证明申请人能在当前虚拟群中发消息，不能单独证明手填真实群号属于当前虚拟群。启用邮箱模式时，`qgconfirm` 先把候选真实群号放入 `pending_verification`，再把验证码发到已认证群主的 `<QQ号>@qq.com`；只有 `qgcode` 成功后才写入 `verified`，群业务不会在邮箱认证前放行。未启用邮箱模式时，普通 `qgconfirm` 仍兼容本地 `declared` 流程。
-- QBind/QGroupBind 不直接读写 Gensokyo 的 idmap 数据库，也不会在普通绑定/解绑流程中调用 Gensokyo `type=5`；`type=11` 仅保留为可选的可信群/用户联合验证来源。
+- QQ 邮箱验证码精确验证挑战中保存的 candidate QQ：先将原事件键的个人记录置为 verified，再预检候选事件键。type=5 明确返回 status=success 只表示后端接受映射更新，不证明 QQ 所有权。在当前部署假设（候选键等于映射后事件键）成立时，才会在同一 self_id 下原子创建 candidate 事件键到该 canonical 的 verified 别名；这不是适配器保证：适配器不提供映射 readback 或事件身份保证。原记录不会被替换。
+- 失败恢复只从当前原 source `S = (self_id, event.user_id)` 查找：必须恰有一条 purpose/scope/actor/external/candidate/status 精确匹配、group 为空的 `verified` challenge，才重试同一 source 到 QQ 的 type=5 同步；不会从候选事件键或 `user_id == candidate` 回查历史 challenge。0 条、多条、已撤销目标、映射冲突、source 版本在同步期间变化或远端结果失败/未知时均 fail-closed，不创建别名；业务门禁仍只精确查询当前 `(self_id, user_id)`。
+- QBind/QGroupBind 不直接读写 Gensokyo 的 idmap 数据库。批量命令 `批量重同步用户映射` 默认只输出汇总预览；追加 `执行` 后，才会串行同步 `declared`/`verified` 的生效个人记录。若跨 Bot 记录对同一虚拟 user ID 指向不同 QQ，命令会中止；整个流程仅调用个人 type=5 映射，不调用群组/频道映射 API。`type=11` 仅保留为可选的可信群/用户联合验证来源。
 - 未传 `self_id` 的 `get_real_qq()` 仅保留旧版单参数兼容行为，不会扫描所有 Bot 命名空间。新代码应使用 `get_verified_qq(user_id, self_id)` 或 Core 的 resolver。
+
+- 个人 type=5 映射没有 Bot scope，因此单次确认、邮箱认证和重同步在写入前检查同一外部 virtual ID 的 active canonical QQ；跨 Bot 目标不一致时阻止远端写入，相同 pair 可复用。此检查只保护映射一致性，不代表身份所有权验证。
 
 ## 指令
 
@@ -19,6 +23,7 @@ QBind 是 Amia 插件生态唯一的个人/群组身份绑定边界。它负责�
 - `qbind <QQ号>`：创建个人声明并发送一次性确认请求。
 - `confirm_bind <请求令牌>`：确认本人请求；按钮会自动携带令牌，纯文本 `confirm_bind` 仍兼容当前用户的最新待确认请求。
 - `qbindcode <6位验证码>`：在邮箱模式下提交发送到该 QQ 邮箱的验证码，完成个人 `verified` 认证。
+- `批量重同步用户映射`：SUPERUSER 命令；默认仅输出汇总预览，追加 `执行` 才会串行同步当前生效的 `declared`/`verified` 个人映射。
 - `cancel_bind <请求令牌>`：取消本人待确认请求。
 - `qunbind`：为当前 Bot 下自己的绑定创建解绑确认请求。解绑时会再次检查记录归属，命令中填入其他人的 QQ 号不会触发后端操作。
 
@@ -64,12 +69,12 @@ QBIND_GENSOKYO_API_URL=http://127.0.0.1:15630
 QBIND_GENSOKYO_TIMEOUT=5
 QBIND_USE_MARKDOWN=true
 QBIND_EMAIL_REQUIRED=true
-QBIND_SMTP_HOST=smtp.feishu.cn
+QBIND_SMTP_HOST=smtpdm.aliyun.com
 QBIND_SMTP_PORT=465
 QBIND_SMTP_SSL=true
-QBIND_SMTP_USER=Amia@mizuki.top
-QBIND_SMTP_FROM=Amia@mizuki.top
-QBIND_SMTP_PASSWORD=<本机填写的飞书邮箱客户端专用密码>
+QBIND_SMTP_USER=verify@mizuki.top
+QBIND_SMTP_FROM="Amia Verification" <verify@mizuki.top>
+QBIND_SMTP_PASSWORD=<本机填写的阿里云 SMTP 密码>
 QBIND_EMAIL_CODE_TTL_SECONDS=600
 QBIND_EMAIL_MAX_ATTEMPTS=5
 QBIND_SMTP_TIMEOUT=15
