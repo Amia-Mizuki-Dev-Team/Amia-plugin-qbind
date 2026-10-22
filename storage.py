@@ -1649,6 +1649,38 @@ class QbindStore:
             finally:
                 connection.close()
 
+    def list_groups_by_real(
+        self, bot_scope: object, real_group_id: object
+    ) -> list[GroupBinding]:
+        """Return every active binding that still claims one real group ID.
+
+        ``get_group_by_real`` reports only the newest claim, which hides a
+        stale placeholder such as a ``verified`` row from another virtual
+        group.  An operator revoking by real group number needs all occupying
+        rows, so the read paths can be cleared one binding at a time.
+        """
+
+        scope = _normalise(bot_scope, "bot_scope")
+        real_id = _normalise(real_group_id, "real_group_id")
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM group_bindings
+                    WHERE bot_scope = ? AND real_group_id = ?
+                      AND binding_status IN (
+                        'verified', 'pending_verification', 'declared', 'conflict'
+                      )
+                    ORDER BY version DESC, virtual_group_id ASC
+                    """,
+                    (scope, real_id),
+                ).fetchall()
+                bindings = [self._group_from_row(row) for row in rows]
+                return [binding for binding in bindings if binding is not None]
+            finally:
+                connection.close()
+
     def record_verified_membership(
         self,
         *,

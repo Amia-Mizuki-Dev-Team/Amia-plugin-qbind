@@ -1530,6 +1530,139 @@ async def qgstatus_handler(event: GroupMessageEvent):
     )
 
 
+def _real_revoke_empty_message():
+    return _message(
+        "### ℹ️ 没有找到占用该真实群号的群绑定",
+        _group_action_buttons(include_bind=True),
+    )
+
+
+async def _qgunbind_real_preview(*, scope: str, user_id: str, real_id: str) -> None:
+    """Show what a real-group-number revoke would clear, then ask to confirm."""
+
+    try:
+        rows = _store().list_groups_by_real(scope, real_id)
+    except QbindStorageError:
+        logger.exception("qgunbind could not list bindings for a real group id")
+        await qgunbind.finish(
+            _message(
+                "### ❌ 撤销失败\n\n> 无法读取占用该真实群号的群绑定，请稍后重试。",
+                _group_action_buttons(include_status=True),
+            )
+        )
+    if not rows:
+        await qgunbind.finish(_real_revoke_empty_message())
+    lines = [
+        "### ⚠️ 按真实群号撤销群绑定",
+        "",
+        f"> 真实群号：`{real_id}`",
+        f"> 当前占用记录：{len(rows)} 条",
+    ]
+    lines.extend(
+        f"> 占位虚拟群：`{row.virtual_group_id}`（状态 `{row.binding_status}`）"
+        for row in rows[:5]
+    )
+    if len(rows) > 5:
+        lines.append(f"> 其余 {len(rows) - 5} 条占位记录未列出。")
+    lines.append("> 撤销后该真实群号可以重新绑定；请确认这不是你正在使用的群。")
+    await qgunbind.finish(
+        _message(
+            "\n".join(lines),
+            [
+                [
+                    {
+                        "render_data.label": "确认撤销",
+                        "action.data": f"qgunbind confirm {real_id}",
+                        "action.enter": True,
+                        "action.permission.type": 0,
+                        "action.permission.specify_user_ids": [str(user_id)],
+                    }
+                ],
+                [
+                    {
+                        "render_data.label": "取消",
+                        "action.data": "qgstatus",
+                        "action.enter": True,
+                    }
+                ],
+            ],
+        )
+    )
+
+
+async def _qgunbind_real_execute(*, scope: str, user_id: str, real_id: str) -> None:
+    """Revoke every active binding that still claims ``real_id``."""
+
+    try:
+        rows = _store().list_groups_by_real(scope, real_id)
+    except QbindStorageError:
+        logger.exception("qgunbind could not list bindings for a real group id")
+        await qgunbind.finish(
+            _message(
+                "### ❌ 撤销失败\n\n> 无法读取占用该真实群号的群绑定，请稍后重试。",
+                _group_action_buttons(include_status=True),
+            )
+        )
+    if not rows:
+        await qgunbind.finish(_real_revoke_empty_message())
+    revoked_count = 0
+    skipped_count = 0
+    try:
+        for row in rows:
+            try:
+                revoked = _store().revoke_group(
+                    bot_scope=scope,
+                    virtual_group_id=row.virtual_group_id,
+                    actor_user_id=user_id,
+                    expected_version=row.version,
+                )
+            except (BindingConflictError, QbindStorageError):
+                # A row that changed between the read and the write (or that is
+                # already revoked) is not an operator error; leave it and say so.
+                skipped_count += 1
+                logger.info(
+                    "qgunbind by real group skipped a changed binding real=%s virtual=%s",
+                    real_id,
+                    row.virtual_group_id,
+                )
+                continue
+            revoked_count += 1
+            logger.info(
+                "qgunbind by real group revoked binding real=%s virtual=%s version=%s",
+                real_id,
+                row.virtual_group_id,
+                revoked.version,
+            )
+            from . import _notify_membership_observer
+
+            await _notify_membership_observer(
+                {
+                    "operation": "revoke_group",
+                    "bot_scope": scope,
+                    "virtual_group_id": row.virtual_group_id,
+                    "real_group_id": row.real_group_id or revoked.real_group_id,
+                }
+            )
+    except Exception as error:  # noqa: BLE001 - surfaced to the operator below
+        logger.exception("qgunbind failed to revoke bindings by real group id")
+        reason = " ".join(str(error).split())[:120] or type(error).__name__
+        await qgunbind.finish(
+            _message(
+                "### ❌ 撤销失败\n\n" f"> {reason}",
+                _group_action_buttons(include_status=True),
+            )
+        )
+    await qgunbind.finish(
+        _message(
+            "### ✅ 已按真实群号撤销群绑定\n\n"
+            f"> 真实群号：`{real_id}`\n"
+            f"> 已撤销 {revoked_count} 条，跳过 {skipped_count} 条（状态已变化）\n"
+            "> GSK type=5 不提供可靠删除，远端映射需显式对账；群绑定历史已保留。",
+            _group_action_buttons(include_status=True, include_bind=True),
+        )
+    )
+
+
 qgunbind = on_command("qgunbind", priority=5, block=False)
 
 
@@ -1548,11 +1681,38 @@ async def qgunbind_handler(event: GroupMessageEvent, arg: Message = CommandArg()
             )
         )
     value = arg.extract_plain_text().strip()
+    parts = value.split()
+    if value and not _token(value):
+        if parts[0].lower() == "confirm":
+            candidate = parts[1] if len(parts) == 2 else ""
+            if _GROUP_ID_RE.fullmatch(candidate):
+                await _qgunbind_real_execute(
+                    scope=scope, user_id=user_id, real_id=candidate
+                )
+                return
+            await qgunbind.finish(
+                _message(
+                    "### ❌ 解绑失败\n\n"
+                    "> 真实群号格式不正确，请使用 `qgunbind confirm <5-12 位群号>`。",
+                    _group_action_buttons(include_status=True),
+                )
+            )
+        if _GROUP_ID_RE.fullmatch(value):
+            await _qgunbind_real_preview(
+                scope=scope, user_id=user_id, real_id=value
+            )
+            return
     token = value if value else None
     if token and not _token(token):
+        detail = (
+            "真实群号格式不正确，请输入 5-12 位非零开头的数字群号，"
+            "例如 `qgunbind 389876336`。"
+            if value.isdigit()
+            else "解绑令牌格式不正确，请使用原消息中的按钮。"
+        )
         await qgunbind.finish(
             _message(
-                "### ❌ 解绑失败\n\n> 解绑令牌格式不正确，请使用原消息中的按钮。",
+                f"### ❌ 解绑失败\n\n> {detail}",
                 _group_action_buttons(include_status=True),
             )
         )
