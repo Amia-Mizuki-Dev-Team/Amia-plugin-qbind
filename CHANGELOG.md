@@ -2,6 +2,14 @@
 
 All notable changes to QBind are documented here.
 
+## [2026-10-23]
+
+### Added
+- Email proof now transfers a canonical QQ held by an older session identity: the conflict answers with a code prompt instead of a dead end, and a successful code moves the binding to the current identity without creating an alias. Declared or unbind-pending owners still conflict, because they never proved ownership.
+
+### Fixed
+- Masked addresses render with U+2217 so markdown cannot swallow the asterisks.
+
 ## [2026-10-22]
 
 ### Added
