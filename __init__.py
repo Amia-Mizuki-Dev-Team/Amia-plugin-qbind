@@ -212,6 +212,16 @@ def _personal_email_code_buttons(user_id: str) -> List[List[Dict[str, Any]]]:
     ]
 
 
+def _masked_for_display(value: str) -> str:
+    """Render a masked address with ``∗`` so it cannot be read as a glob.
+
+    ``mail.mask_email`` keeps ASCII ``*`` because the masking contract is
+    asserted verbatim elsewhere; only the receipt text is swapped.
+    """
+
+    return str(value).replace("*", "∗")
+
+
 # ---------------------------------------------------------------------------
 # Store lifecycle and legacy compatibility
 # ---------------------------------------------------------------------------
@@ -1612,7 +1622,7 @@ async def bind_handler(
                 await bind.finish(
                     _reply(
                         "### 📩 重新验证 QQ 邮箱\n\n"
-                        f"> 验证码已发送至：`{masked}`\n"
+                        f"> 验证码已发送至：`{_masked_for_display(masked)}`\n"
                         "> 请发送 `qbindcode <6位验证码>` 完成个人绑定。\n"
                         "> 验证码有效期为 10 分钟。",
                         _personal_email_code_buttons(user_id),
@@ -1776,19 +1786,93 @@ async def confirm_handler(
 
     candidate = request.candidate_id or ""
     existing_owners = get_store().list_active_personal_by_canonical(scope, candidate)
-    if any(owner.external_user_id != user_id for owner in existing_owners):
+    foreign_owners = [
+        owner
+        for owner in existing_owners
+        if owner.external_user_id != user_id
+    ]
+    if foreign_owners:
         logger.warning(
-            "QBind confirmation rejected; "
+            "QBind confirmation hit an existing canonical owner; "
             "reason_code=confirm_bind.canonical_owner_exists"
         )
-        failed = get_store().complete_confirmation(
-            request.request_id,
-            result_code="conflict",
-            status=REQUEST_FAILED,
-            error="canonical identity is already owned by another user",
+        if any(
+            owner.binding_status != PERSONAL_VERIFIED for owner in foreign_owners
+        ):
+            # declare_personal(allow_verified_canonical_reuse=True) only reuses
+            # a canonical whose other owners are all verified, so a declared or
+            # unbind_pending owner cannot be taken over even with mailbox proof.
+            get_store().complete_confirmation(
+                request.request_id,
+                result_code="conflict",
+                status=REQUEST_FAILED,
+                error="canonical identity is already owned by another user",
+            )
+            await confirm.finish(
+                _reply(
+                    "### ❌ QQ 号绑定冲突：该 QQ 号正被其他会话身份占用\n\n"
+                    "> 占用方尚未完成验证，当前不能接管；"
+                    "请等待对方完成验证或联系管理员对账。",
+                    _personal_action_buttons(user_id),
+                )
+            )
+        if not email_verification_required():
+            failed = get_store().complete_confirmation(
+                request.request_id,
+                result_code="conflict",
+                status=REQUEST_FAILED,
+                error="canonical identity is already owned by another user",
+            )
+            await confirm.finish(
+                _reply(
+                    "### ❌ QQ 号绑定冲突：该 QQ 号已被其他会话身份绑定\n\n"
+                    "> 当前部署为本地声明模式，需要启用 QQ 邮箱认证后，"
+                    "才能通过邮箱验证证明归属并转移绑定。\n"
+                    "> 如急需处理，请联系管理员对账。",
+                    _personal_action_buttons(user_id),
+                )
+            )
+        # Another virtual identity already owns this canonical QQ.  The mailbox
+        # is the same ownership proof required for a first bind, so passing it
+        # transfers the canonical to this identity; the previous row stays
+        # verified as history and the takeover creates no event alias.
+        try:
+            _, masked = await start_email_challenge(
+                purpose="personal_bind",
+                bot_scope=scope,
+                actor_user_id=user_id,
+                external_user_id=user_id,
+                candidate_id=candidate,
+                qq_number=candidate,
+            )
+        except (MailConfigurationError, MailDeliveryError) as error:
+            logger.exception(
+                "personal QQ email verification code delivery failed during takeover"
+            )
+            failed = get_store().complete_confirmation(
+                request.request_id,
+                result_code="failed",
+                status=REQUEST_FAILED,
+                error=str(error),
+            )
+            await confirm.finish(
+                _reply(
+                    f"### ❌ 邮箱验证码发送失败\n\n> {error}",
+                    _personal_action_buttons(user_id, include_unbind=False),
+                )
+            )
+        get_store().complete_confirmation(
+            request.request_id, result_code="email_pending"
         )
         await confirm.finish(
-            _reply(_request_message(failed or request), _personal_action_buttons(user_id))
+            _reply(
+                "### 📩 该 QQ 号已有绑定记录，需验证归属\n\n"
+                f"> 验证码已发送至：`{_masked_for_display(masked)}`\n"
+                "> 该 QQ 号当前绑定在另一个会话身份上；"
+                "完成邮箱验证后会自动转移到当前身份。\n"
+                "> 请发送 `qbindcode <6位验证码>` 完成验证，有效期 10 分钟。",
+                _personal_email_code_buttons(user_id),
+            )
         )
     try:
         _assert_personal_mapping_consistent(user_id, candidate)
@@ -1842,7 +1926,7 @@ async def confirm_handler(
         await confirm.finish(
             _reply(
                 "### 📩 QQ 邮箱验证已发起\n\n"
-                f"> 验证码已发送至：`{masked}`\n"
+                f"> 验证码已发送至：`{_masked_for_display(masked)}`\n"
                 "> 请发送 `qbindcode <6位验证码>` 完成个人绑定。\n"
                 "> 验证码有效期为 10 分钟，最多可尝试 5 次。",
                 _personal_email_code_buttons(user_id),
@@ -2015,6 +2099,20 @@ async def _finalize_personal_email_binding(
         else:
             verified = current
 
+        other_owners = [
+            owner
+            for owner in get_store().list_active_personal_by_canonical(scope, candidate)
+            if owner.external_user_id != user_id
+        ]
+        if other_owners:
+            # Email proof is the same evidence as a first bind, so a canonical
+            # already held by another identity moves here.  The previous row
+            # stays verified for history and no event alias is created.
+            logger.info(
+                "personal canonical taken over by email proof (source=%s)",
+                verified.verification_source,
+            )
+            return verified
         source_expected_version = verified.version
         get_store().assert_verified_personal_alias_available(
             bot_scope=scope,
