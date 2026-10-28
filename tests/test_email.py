@@ -663,28 +663,150 @@ class TestEmailVerification(unittest.TestCase):
                     PlainArg(self.sender.messages[-1]["code"]),
                 )
             )
-            self.assertIn("群主 QQ 邮箱认证完成", message)
+            self.assertIn("群绑定 QQ 邮箱认证完成", message)
             record = qbind.get_store().get_group("bot-a", "virtual-group")
             self.assertIsNotNone(record)
             self.assertEqual(record.binding_status, "verified")
         finally:
             group.set_group_verifier(original_verifier)
 
-    def test_email_mode_requires_the_current_group_owner(self):
-        qbind.get_store().declare_personal(
+    def _verify_personal_email(self, user_id: str, qq: str = "1234567") -> None:
+        store = qbind.get_store()
+        store.declare_personal(
             bot_scope="bot-a",
-            external_user_id="admin-1",
-            canonical_user_id="1234567",
-            bound_by_user_id="admin-1",
+            external_user_id=user_id,
+            canonical_user_id=qq,
+            bound_by_user_id=user_id,
             verification_source="test",
         )
-        qbind.get_store().verify_personal(
+        store.verify_personal(
             bot_scope="bot-a",
-            external_user_id="admin-1",
-            verified_by="admin-1",
+            external_user_id=user_id,
+            verified_by=user_id,
             verification_source="test:qq_email",
         )
 
+    def _start_group_binding(self, event, bot, candidate: str = "9876543"):
+        """Run qgbind + qgconfirm and return the pending confirmation request."""
+
+        run(
+            capture_handler(
+                group.qgbind,
+                group.qgbind_handler,
+                event,
+                bot,
+                PlainArg(candidate),
+            )
+        )
+        request = qbind.get_store().find_confirmation(
+            request_kind="group_bind",
+            bot_scope="bot-a",
+            actor_user_id=event.get_user_id(),
+            external_group_id="virtual-group",
+            candidate_id=candidate,
+        )
+        self.assertIsNotNone(request)
+        message = run(
+            capture_handler(
+                group.qgconfirm,
+                group.qgconfirm_handler,
+                event,
+                bot,
+                PlainArg(request.request_id),
+            )
+        )
+        self.assertIn("qgcode", message)
+        return request
+
+    def test_group_admin_email_code_finalizes_group_binding(self):
+        # Email proof of the operator's own QQ mailbox is the trust anchor, so a
+        # group admin may bind the group with a code mailed to that mailbox.
+        self._verify_personal_email("admin-1")
+        original_verifier = group.get_group_verifier()
+        group.set_group_verifier(group.GensokyoGroupVerifier(FakeGroupMappingClient()))
+        try:
+            event = FakeGroupEvent("admin-1", role="admin")
+            bot = FakeBot()
+            request = self._start_group_binding(event, bot)
+            self.assertEqual(request.actor_user_id, "admin-1")
+            # The code goes to the operator's own verified mailbox, never the group.
+            self.assertEqual(self.sender.messages[-1]["recipient"], "1234567@qq.com")
+            receipts: list[object] = []
+
+            async def capture_send(value=None, *unused_args, **unused_kwargs):
+                receipts.append(value)
+
+            with (
+                patch.object(qbind, "sync_verified_pair", unittest.mock.AsyncMock()),
+                patch.object(
+                    qbind, "_publish_verified_membership", unittest.mock.AsyncMock()
+                ),
+                patch.object(group.qgcode, "send", capture_send),
+            ):
+                run(
+                    capture_handler(
+                        group.qgcode,
+                        group.qgcode_handler,
+                        event,
+                        PlainArg(self.sender.messages[-1]["code"]),
+                    )
+                )
+            self.assertIn("群绑定 QQ 邮箱认证完成", " ".join(map(str, receipts)))
+            record = qbind.get_store().get_group("bot-a", "virtual-group")
+            self.assertIsNotNone(record)
+            self.assertEqual(record.binding_status, "verified")
+            self.assertEqual(record.verified_by, "admin-1")
+        finally:
+            group.set_group_verifier(original_verifier)
+
+    def test_group_binding_reply_never_echoes_the_email_code_into_the_group(self):
+        # The code proves control of the operator's own mailbox; a group reply
+        # may only ever show the masked address, never the code itself.
+        self._verify_personal_email("admin-1")
+        original_verifier = group.get_group_verifier()
+        group.set_group_verifier(group.GensokyoGroupVerifier(FakeGroupMappingClient()))
+        try:
+            bot = FakeBot()
+            event = FakeGroupEvent("admin-1", role="admin")
+            bind_message = run(
+                capture_handler(
+                    group.qgbind,
+                    group.qgbind_handler,
+                    event,
+                    bot,
+                    PlainArg("9876543"),
+                )
+            )
+            request = qbind.get_store().find_confirmation(
+                request_kind="group_bind",
+                bot_scope="bot-a",
+                actor_user_id="admin-1",
+                external_group_id="virtual-group",
+                candidate_id="9876543",
+            )
+            self.assertIsNotNone(request)
+            confirm_message = run(
+                capture_handler(
+                    group.qgconfirm,
+                    group.qgconfirm_handler,
+                    event,
+                    bot,
+                    PlainArg(request.request_id),
+                )
+            )
+            code = self.sender.messages[-1]["code"]
+            self.assertEqual(self.sender.messages[-1]["recipient"], "1234567@qq.com")
+            self.assertNotIn(code, str(bind_message))
+            self.assertNotIn(code, str(confirm_message))
+            self.assertIn("12*****@qq.com", str(confirm_message))
+            self.assertNotIn("1234567@qq.com", str(confirm_message))
+            record = qbind.get_store().get_group("bot-a", "virtual-group")
+            self.assertIsNotNone(record)
+            self.assertEqual(record.binding_status, "pending_verification")
+        finally:
+            group.set_group_verifier(original_verifier)
+
+    def test_group_admin_without_personal_email_auth_is_guided_to_personal_bind(self):
         message = run(
             capture_handler(
                 group.qgbind,
@@ -694,12 +816,97 @@ class TestEmailVerification(unittest.TestCase):
                 PlainArg("9876543"),
             )
         )
-        self.assertIn("只有当前群主", str(message))
+        self.assertIn("需要先完成个人 QQ 邮箱认证", message)
+        self.assertIn("qbind", message)
         self.assertIsNone(
             qbind.get_store().find_confirmation(
                 request_kind="group_bind",
                 bot_scope="bot-a",
                 actor_user_id="admin-1",
+                external_group_id="virtual-group",
+            )
+        )
+
+    def test_group_member_cannot_start_email_group_binding(self):
+        # Even a personally verified member stays outside the operator scope.
+        self._verify_personal_email("member-1")
+        message = run(
+            capture_handler(
+                group.qgbind,
+                group.qgbind_handler,
+                FakeGroupEvent("member-1", role="member"),
+                FakeBot(),
+                PlainArg("9876543"),
+            )
+        )
+        self.assertIn("只有当前群主/管理员或 Bot SUPERUSER", message)
+        self.assertIn("操作者本人已认证的 QQ 邮箱", message)
+        self.assertIsNone(
+            qbind.get_store().find_confirmation(
+                request_kind="group_bind",
+                bot_scope="bot-a",
+                actor_user_id="member-1",
+                external_group_id="virtual-group",
+            )
+        )
+
+    def test_group_email_code_cannot_be_submitted_by_another_operator(self):
+        self._verify_personal_email("admin-1")
+        self._verify_personal_email("admin-2", qq="7654321")
+        original_verifier = group.get_group_verifier()
+        group.set_group_verifier(group.GensokyoGroupVerifier(FakeGroupMappingClient()))
+        try:
+            bot = FakeBot()
+            self._start_group_binding(FakeGroupEvent("admin-1", role="admin"), bot)
+            code = self.sender.messages[-1]["code"]
+            message = run(
+                capture_handler(
+                    group.qgcode,
+                    group.qgcode_handler,
+                    FakeGroupEvent("admin-2", role="admin"),
+                    PlainArg(code),
+                )
+            )
+            self.assertIn("没有待验证的群邮箱请求", message)
+            record = qbind.get_store().get_group("bot-a", "virtual-group")
+            self.assertIsNotNone(record)
+            self.assertEqual(record.binding_status, "pending_verification")
+        finally:
+            group.set_group_verifier(original_verifier)
+
+    def test_superuser_follows_operator_semantics_in_email_mode(self):
+        def is_superuser(user_id: str) -> bool:
+            return user_id == "super-1"
+
+        with patch.object(group, "_is_superuser", is_superuser):
+            message = run(
+                capture_handler(
+                    group.qgbind,
+                    group.qgbind_handler,
+                    FakeGroupEvent("super-1", role="member"),
+                    FakeBot(),
+                    PlainArg("9876543"),
+                )
+            )
+            # A SUPERUSER clears the operator gate and is then held to the same
+            # personal mailbox prerequisite as owner/admin.
+            self.assertIn("需要先完成个人 QQ 邮箱认证", message)
+            self._verify_personal_email("super-1")
+            message = run(
+                capture_handler(
+                    group.qgbind,
+                    group.qgbind_handler,
+                    FakeGroupEvent("super-1", role="member"),
+                    FakeBot(),
+                    PlainArg("9876543"),
+                )
+            )
+            self.assertIn("确认当前群绑定", message)
+        self.assertIsNotNone(
+            qbind.get_store().find_confirmation(
+                request_kind="group_bind",
+                bot_scope="bot-a",
+                actor_user_id="super-1",
                 external_group_id="virtual-group",
                 candidate_id="9876543",
             )

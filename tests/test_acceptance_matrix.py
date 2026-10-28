@@ -1423,6 +1423,101 @@ class TestGroupAcceptance(AcceptanceBase):
             )
         )
 
+    def test_10_2_email_mode_admin_operator_can_request_but_member_cannot(self):
+        # Email mode used to be owner-only; the operator's own verified mailbox
+        # is the trust anchor, so admins may request too.  Everyone else, and
+        # any operator without personal email proof, is still stopped.
+        qbind.set_email_service(
+            QbindEmailService(
+                SMTPConfig(
+                    host="smtp.test",
+                    port=465,
+                    use_ssl=True,
+                    username="bot@example.test",
+                    password="test-password",
+                    from_address="bot@example.test",
+                    timeout_seconds=5.0,
+                    challenge_ttl_seconds=600.0,
+                    max_attempts=5,
+                    resend_cooldown_seconds=0.0,
+                    required=True,
+                    code_secret="test-only",
+                )
+            )
+        )
+        store = qbind.get_store()
+        store.declare_personal(
+            bot_scope="bot-a",
+            external_user_id="admin-1",
+            canonical_user_id="1234567",
+            bound_by_user_id="admin-1",
+            verification_source="test",
+        )
+        store.verify_personal(
+            bot_scope="bot-a",
+            external_user_id="admin-1",
+            verified_by="admin-1",
+            verification_source="test:qq_email",
+        )
+
+        message = run(
+            capture_handler(
+                group.qgbind,
+                group.qgbind_handler,
+                FakeEvent("admin-1", group_id="virtual-group-1", role="admin"),
+                FakeBot(),
+                PlainArg("9876543"),
+            )
+        )
+        self.assertIn("确认当前群绑定", message)
+        self.assertIsNotNone(
+            store.find_confirmation(
+                request_kind="group_bind",
+                bot_scope="bot-a",
+                actor_user_id="admin-1",
+                external_group_id="virtual-group-1",
+                candidate_id="9876543",
+            )
+        )
+
+        message = run(
+            capture_handler(
+                group.qgbind,
+                group.qgbind_handler,
+                FakeEvent("member-1", group_id="virtual-group-1", role="member"),
+                FakeBot(),
+                PlainArg("9876544"),
+            )
+        )
+        self.assertIn("只有当前群主/管理员或 Bot SUPERUSER", message)
+        self.assertIsNone(
+            store.find_confirmation(
+                request_kind="group_bind",
+                bot_scope="bot-a",
+                actor_user_id="member-1",
+                external_group_id="virtual-group-1",
+            )
+        )
+
+        message = run(
+            capture_handler(
+                group.qgbind,
+                group.qgbind_handler,
+                FakeEvent("admin-2", group_id="virtual-group-1", role="admin"),
+                FakeBot(),
+                PlainArg("9876545"),
+            )
+        )
+        self.assertIn("需要先完成个人 QQ 邮箱认证", message)
+        self.assertIsNone(
+            store.find_confirmation(
+                request_kind="group_bind",
+                bot_scope="bot-a",
+                actor_user_id="admin-2",
+                external_group_id="virtual-group-1",
+            )
+        )
+
     def test_expired_same_candidate_request_does_not_block_new_qgbind(self):
         store = qbind.get_store()
         old_request = store.create_confirmation(

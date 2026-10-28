@@ -2,13 +2,13 @@
 
 QBind 是 Amia 插件生态唯一的个人/群组身份绑定边界。它负责保存外部 Bot 身份与 canonical 身份之间的绑定状态，并向其他插件提供解析接口；它不负责 Economy、Profile、Send 或其他业务资产。
 
-当前本地实现已完成 QBind V2 的 M0/M1 基础安全边界：个人和群绑定都使用 SQLite 状态存储和审计日志，确认请求绑定 Bot `self_id`、外部身份和有效期。生产配置已接入本地 QQ 邮箱认证：个人绑定验证码只发送到用户提交的 `<QQ号>@qq.com`，群绑定验证码只发送到已完成个人认证的群主 QQ 邮箱；两次验证码都通过后，个人和群才会进入 `verified` 并放行普通业务。不会把 Gensokyo `type=5` 的“请求成功”误当作 QQ/群号归属验证。真实 SMTP、后端和生产实机验收仍不能由本地单元测试代替。
+当前本地实现已完成 QBind V2 的 M0/M1 基础安全边界：个人和群绑定都使用 SQLite 状态存储和审计日志，确认请求绑定 Bot `self_id`、外部身份和有效期。生产配置已接入本地 QQ 邮箱认证：个人绑定验证码只发送到用户提交的 `<QQ号>@qq.com`，群绑定验证码只发送到发起绑定的群主/管理员本人已完成个人认证的 QQ 邮箱；两次验证码都通过后，个人和群才会进入 `verified` 并放行普通业务。不会把 Gensokyo `type=5` 的“请求成功”误当作 QQ/群号归属验证。真实 SMTP、后端和生产实机验收仍不能由本地单元测试代替。
 
 ## 重要信任边界
 
 - Gensokyo `getid?type=5` 调用 `UpdateVirtualValue(oldRowValue, newRowValue)`：`oldRowValue` 是虚拟 user ID，`newRowValue` 是 canonical QQ。HTTP 成功只说明后端接受了映射更新，不证明用户拥有该 QQ 号。个人确认和同 QQ 的 QBind 重同步会调用此接口；SUPERUSER 可用 `批量重同步用户映射` 对当前生效的个人记录进行批量同步。
 - 因此未启用邮箱模式时，个人确认后的记录状态仍是 `declared`，兼容后台可通过 `get_real_qq(user_id, self_id)` 使用该声明值；启用 `QBIND_EMAIL_REQUIRED=true` 后，`qbindcode` 会把声明提升为 `verified`，普通业务门禁也只接受 `verified`。`QbindIdentityResolver` 只把已验证个人身份作为 `canonical_user_id` 返回；跨群共享等高信任功能仍应要求 `verified`。
-- 群内确认只能证明申请人能在当前虚拟群中发消息，不能单独证明手填真实群号属于当前虚拟群。启用邮箱模式时，`qgconfirm` 先把候选真实群号放入 `pending_verification`，再把验证码发到已认证群主的 `<QQ号>@qq.com`；只有 `qgcode` 成功后才写入 `verified`，群业务不会在邮箱认证前放行。未启用邮箱模式时，普通 `qgconfirm` 仍兼容本地 `declared` 流程。
+- 群内确认只能证明申请人能在当前虚拟群中发消息，不能单独证明手填真实群号属于当前虚拟群。启用邮箱模式时，`qgconfirm` 先把候选真实群号放入 `pending_verification`，再把验证码发到发起人本人已完成个人认证的 `<QQ号>@qq.com`；只有 `qgcode` 成功后才写入 `verified`，群业务不会在邮箱认证前放行。未启用邮箱模式时，普通 `qgconfirm` 仍兼容本地 `declared` 流程。
 - QQ 邮箱验证码精确验证挑战中保存的 candidate QQ：先将原事件键的个人记录置为 verified，再预检候选事件键。type=5 明确返回 status=success 只表示后端接受映射更新，不证明 QQ 所有权。在当前部署假设（候选键等于映射后事件键）成立时，才会在同一 self_id 下原子创建 candidate 事件键到该 canonical 的 verified 别名；这不是适配器保证：适配器不提供映射 readback 或事件身份保证。原记录不会被替换。
 - 失败恢复只从当前原 source `S = (self_id, event.user_id)` 查找：必须恰有一条 purpose/scope/actor/external/candidate/status 精确匹配、group 为空的 `verified` challenge，才重试同一 source 到 QQ 的 type=5 同步；不会从候选事件键或 `user_id == candidate` 回查历史 challenge。0 条、多条、已撤销目标、映射冲突、source 版本在同步期间变化或远端结果失败/未知时均 fail-closed，不创建别名；业务门禁仍只精确查询当前 `(self_id, user_id)`。
 - QBind/QGroupBind 不直接读写 Gensokyo 的 idmap 数据库。批量命令 `批量重同步用户映射` 默认只输出汇总预览；追加 `执行` 后，才会串行同步 `declared`/`verified` 的生效个人记录。若跨 Bot 记录对同一虚拟 user ID 指向不同 QQ，命令会中止；整个流程仅调用个人 type=5 映射，不调用群组/频道映射 API。`type=11` 仅保留为可选的可信群/用户联合验证来源。
@@ -31,7 +31,7 @@ QBind 是 Amia 插件生态唯一的个人/群组身份绑定边界。它负责�
 
 - `qgbind <真实群号>`：必须在群聊中由群主/管理员或 Bot SUPERUSER 发起当前虚拟群绑定。
 - `qgconfirm <请求令牌>`：重新检查当前 Bot、群、发起人和权限后提交群映射声明。
-- `qgcode <6位验证码>`：在邮箱模式下提交发送到群主 QQ 邮箱的验证码，完成群 `verified` 认证。
+- `qgcode <6位验证码>`：在邮箱模式下提交发送到操作者本人 QQ 邮箱的验证码，完成群 `verified` 认证。
 - `qgcancel <请求令牌>`：取消当前群的待确认请求。
 - `qgstatus`：查询当前虚拟群的状态。
 - `qgunbind`：创建并确认当前群解绑；只撤销群映射，不删除成员个人档案。
@@ -44,10 +44,10 @@ QBind 是 Amia 插件生态唯一的个人/群组身份绑定边界。它负责�
 1. 用户先在私聊发送 `qbind <自己的QQ号>`，点击确认后，从自己的 QQ 邮箱收到验证码。
 2. 用户发送 `qbindcode <6位验证码>`，个人绑定进入 `verified`。
 3. 在目标虚拟群内由群主/管理员发送 `qgbind <真实群号>`，再点击按钮或发送 `qgconfirm <请求令牌>`。
-4. QGroupBind 保存候选真实群号和群名为 `pending_verification`，验证码只发到已认证群主的 `<群主QQ号>@qq.com`。
-5. 群主发送 `qgcode <6位验证码>`，群映射进入 `verified`；之后普通群业务才会放行，并可显示“你的档案已分享至 `<群名>`”。
+4. QGroupBind 保存候选真实群号和群名为 `pending_verification`，验证码只发到发起人本人已认证的 `<QQ号>@qq.com`。
+5. 发起人发送 `qgcode <6位验证码>`，群映射进入 `verified`；之后普通群业务才会放行，并可显示“你的档案已分享至 `<群名>`”。
 
-未启用邮箱认证时，流程退化为 `qbind -> confirm_bind` 和 `qgbind -> qgconfirm` 的本地声明兼容模式；这只适合开发/迁移，不满足“本人 QQ 邮箱 + 群主 QQ 邮箱”安全要求。
+未启用邮箱认证时，流程退化为 `qbind -> confirm_bind` 和 `qgbind -> qgconfirm` 的本地声明兼容模式；这只适合开发/迁移，不满足“本人 QQ 邮箱 + 操作者本人 QQ 邮箱”安全要求。
 
 ## 使用前身份门禁
 
@@ -80,7 +80,7 @@ QBIND_EMAIL_MAX_ATTEMPTS=5
 QBIND_SMTP_TIMEOUT=15
 ```
 
-`QBIND_SMTP_PASSWORD` 只能写在本机 `.env`/`.env.dev`，不要提交到 Git、截图或发送到聊天中。QBind 不接受用户自定义邮箱地址：个人和群主收件地址都由已经提交并完成绑定的 QQ 号自动转换为 `<QQ号>@qq.com`。SMTP 密码缺失或发信失败时，绑定请求会失败，不会伪造成功状态。
+`QBIND_SMTP_PASSWORD` 只能写在本机 `.env`/`.env.dev`，不要提交到 Git、截图或发送到聊天中。QBind 不接受用户自定义邮箱地址：个人和群绑定的收件地址都由已经提交并完成绑定的 QQ 号自动转换为 `<QQ号>@qq.com`。SMTP 密码缺失或发信失败时，绑定请求会失败，不会伪造成功状态。
 
 首次加载时，如果同目录存在旧 `binds.json`，QBind 会：
 
@@ -182,7 +182,7 @@ qbind.approve_personal_alias(
 & H:\Amia-Develop\.venv\Scripts\python.exe -m py_compile __init__.py storage.py gensokyo.py group.py identity.py
 ```
 
-测试覆盖本地状态转换、self_id 隔离、旧 JSON 迁移备份、个人声明/验证分离、个人确认超时/越权/冲突/解绑故障、群绑定权限/并发申请/跨群令牌/超时/冲突/解绑/重启恢复、个人+群使用前门禁、QQ 邮箱验证码哈希/错误次数/个人与群主认证流程，以及跨群共享 canonical 身份的本地矩阵。
+测试覆盖本地状态转换、self_id 隔离、旧 JSON 迁移备份、个人声明/验证分离、个人确认超时/越权/冲突/解绑故障、群绑定权限/并发申请/跨群令牌/超时/冲突/解绑/重启恢复、个人+群使用前门禁、QQ 邮箱验证码哈希/错误次数/个人与群绑定认证流程，以及跨群共享 canonical 身份的本地矩阵。
 
 `tests/test_acceptance_matrix.py` 对应附件第十阶段的可自动化部分（10.1–10.3）。这些测试不证明 Gensokyo 后端、真实 QQ 号所有权、真实 QQ 群归属、生产配置、Haruki 双 ID、真实 OneBot 连接或实机交互已经验证；第 10.4 项必须在目标环境完成。
 

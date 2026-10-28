@@ -2,6 +2,12 @@
 
 All notable changes to QBind are documented here.
 
+## [2026-10-28]
+
+### Changed
+- 邮箱认证模式下，群绑定门禁由「仅当前群主」放宽为「群主 / 管理员 / Bot SUPERUSER」；验证码仍只发送到操作者本人已认证的 QQ 邮箱，普通成员仍被拒，其他人不能代填验证码。
+- 群绑定相关文案与 README 同步为「操作者本人邮箱」。
+
 ## [2026-10-23]
 
 ### Added

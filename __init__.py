@@ -892,7 +892,7 @@ def _group_block_prompt(
             "group_pending_verification",
             "### 🔒 本群绑定等待邮箱验证码\n\n"
             "> 本群绑定正在等待邮箱验证码，验证完成前群业务指令不会执行。\n"
-            "> 请群主发送 `qgcode <6位验证码>` 完成验证。\n"
+            "> 请发起人（群主/管理员）发送 `qgcode <6位验证码>` 完成验证。\n"
             "> 可用 `qgstatus` 查看当前群绑定状态。",
             _group_status_buttons(),
         )
@@ -909,7 +909,7 @@ def _group_block_prompt(
             "group_revoked",
             "### 🔒 本群绑定已撤销\n\n"
             "> 本群绑定已撤销，群业务指令不会执行。\n"
-            "> 如需恢复，请由群主重新发送 `qgbind <真实群号>`。\n"
+            "> 如需恢复，请由群主/管理员重新发送 `qgbind <真实群号>`。\n"
             "> 可用 `qgstatus` 查看当前群绑定状态。",
             _group_status_buttons(include_bind=True),
         )

@@ -242,19 +242,6 @@ def _has_group_operator_access(event: Any, user_id: str) -> bool:
     return role in {"admin", "owner"}
 
 
-def _has_group_owner_access(event: Any, _user_id: str) -> bool:
-    """Return whether this event is from the real current group owner.
-
-    A Bot SUPERUSER can manage a local record in legacy mode, but cannot
-    prove ownership of a QQ group.  Email mode therefore requires the
-    OneBot event to identify the sender as ``owner`` so the verification code
-    goes to the owner's own QQ mailbox.
-    """
-
-    sender = getattr(event, "sender", None)
-    return str(getattr(sender, "role", "")).lower() == "owner"
-
-
 def _validate_real_group_id(value: str) -> Optional[str]:
     if not _GROUP_ID_RE.fullmatch(value):
         return "真实群号格式不正确，请输入 5-12 位非零开头数字。"
@@ -298,8 +285,8 @@ def _personal_email_ready(scope: str, user_id: str) -> bool:
 
 def _personal_email_prompt(user_id: str):
     return _message(
-        "### 🔒 群主需要先完成个人 QQ 邮箱认证\n\n"
-        "> 群绑定验证码必须发送到群主本人 QQ 号对应的 QQ 邮箱。\n"
+        "### 🔒 需要先完成个人 QQ 邮箱认证\n\n"
+        "> 群绑定验证码只会发送到操作者本人 QQ 号对应的 QQ 邮箱。\n"
         "> 请先发送 `qbind <你的QQ号>`，完成邮箱验证码认证后再发起 `qgbind`。",
         [
             [
@@ -366,8 +353,8 @@ def _group_email_code_buttons(
 ) -> list[list[dict[str, Any]]]:
     """Build a group email-code input button plus optional navigation.
 
-    The keyboard cannot read a code from the owner's mailbox.  It therefore
-    pre-fills ``qgcode `` without submitting, so the owner can append the
+    The keyboard cannot read a code from the operator's mailbox.  It therefore
+    pre-fills ``qgcode `` without submitting, so the operator can append the
     six-digit code and send it normally.
     """
 
@@ -533,7 +520,7 @@ def _group_conflict_message(request: ConfirmationRequest) -> str:
 def _request_result_message(request: ConfirmationRequest) -> str:
     if request.result_code == "email_pending":
         return (
-            "📩 群主 QQ 邮箱验证码已发送。\n"
+            "📩 群绑定 QQ 邮箱验证码已发送。\n"
             "请发送 `qgcode <6位验证码>` 完成群绑定。"
         )
     if request.result_code == "declared":
@@ -749,16 +736,18 @@ async def _confirm_group_bind(
         return _request_result_message(expired or request)
     from . import email_verification_required
 
-    if email_verification_required():
-        if not _has_group_owner_access(event, user_id):
+    if not _has_group_operator_access(event, user_id):
+        if email_verification_required():
             raise PermissionError(
-                "邮箱认证模式下必须由当前群主确认，验证码将发送到群主 QQ 邮箱"
+                "邮箱认证模式下只有当前群主/管理员或 Bot SUPERUSER 可以确认，"
+                "验证码将发送到操作者本人已认证的 QQ 邮箱"
             )
-    elif not _has_group_operator_access(event, user_id):
-        raise PermissionError("only the current group owner/admin or Bot SUPERUSER may confirm")
+        raise PermissionError(
+            "only the current group owner/admin or Bot SUPERUSER may confirm"
+        )
     if not _personal_email_ready(scope, user_id):
         raise PermissionError(
-            "群主必须先完成个人 QQ 邮箱认证，才能认证这个群的绑定"
+            "操作者必须先完成个人 QQ 邮箱认证，才能认证这个群的绑定"
         )
 
     current = store.get_group(scope, group_id)
@@ -833,10 +822,10 @@ async def _confirm_group_bind(
     from . import email_verification_required, get_verified_qq, start_email_challenge
 
     if email_verification_required() and result.status in {"declared", "verified"}:
-        owner_qq = get_verified_qq(user_id, scope)
-        if not owner_qq:
+        operator_qq = get_verified_qq(user_id, scope)
+        if not operator_qq:
             raise PermissionError(
-                "群主必须先完成个人 QQ 邮箱认证，才能认证这个群的绑定"
+                "操作者必须先完成个人 QQ 邮箱认证，才能认证这个群的绑定"
             )
         try:
             pending = store.set_group_pending(
@@ -858,7 +847,7 @@ async def _confirm_group_bind(
                 candidate_id=candidate,
                 group_name=request.group_name,
                 expected_version=pending.version,
-                qq_number=owner_qq,
+                qq_number=operator_qq,
             )
         except (BindingConflictError, QbindStorageError) as error:
             logger.exception("group email challenge could not enter pending state")
@@ -878,15 +867,15 @@ async def _confirm_group_bind(
                 error=str(error),
             )
             return (
-                "❌ 群主 QQ 邮箱验证码发送失败。\n"
+                "❌ 群绑定 QQ 邮箱验证码发送失败。\n"
                 f"> {error}\n"
                 "> 当前没有把群绑定报告为成功，请修复邮箱配置后重新发起。"
             ) if failed is not None else str(error)
         store.complete_confirmation(request.request_id, result_code="email_pending")
         return (
-            "📩 群主 QQ 邮箱验证已发起。\n"
+            "📩 群绑定 QQ 邮箱验证已发起。\n"
             f"> 验证码已发送至：`{masked}`\n"
-            "> 请群主发送 `qgcode <6位验证码>` 完成群绑定。\n"
+            "> 请发起人发送 `qgcode <6位验证码>` 完成群绑定。\n"
             "> 验证码有效期为 10 分钟，最多可尝试 5 次。"
         )
 
@@ -1028,19 +1017,16 @@ async def qgbind_handler(
     scope, user_id, group_id = context
     from . import email_verification_required
 
-    if email_verification_required() and not _has_group_owner_access(event, user_id):
-        await qgbind.finish(
-            _message(
-                "### ❌ 只有当前群主可以完成邮箱认证\n\n"
-                "> 邮箱模式下验证码必须发送到群主本人 QQ 邮箱，管理员不能代替群主绑定。",
-                _group_action_buttons(include_status=True),
-            )
-        )
     if not _has_group_operator_access(event, user_id):
+        detail = "> 只有当前群主/管理员或 Bot SUPERUSER 可以发起群绑定。"
+        if email_verification_required():
+            detail += (
+                "\n> 邮箱模式下验证码只发送到操作者本人已认证的 QQ 邮箱，"
+                "不会发送到群内。"
+            )
         await qgbind.finish(
             _message(
-                "### ❌ 没有群绑定权限\n\n"
-                "> 只有当前群主/管理员或 Bot SUPERUSER 可以发起群绑定。",
+                f"### ❌ 没有群绑定权限\n\n{detail}",
                 _group_action_buttons(include_status=True),
             )
         )
@@ -1175,19 +1161,16 @@ async def qgrebind_handler(
     scope, user_id, group_id = context
     from . import email_verification_required
 
-    if email_verification_required() and not _has_group_owner_access(event, user_id):
-        await qgrebind.finish(
-            _message(
-                "### ❌ 只有当前群主可以完成邮箱认证\n\n"
-                "> 邮箱模式下验证码必须发送到群主本人 QQ 邮箱，管理员不能代替群主换绑。",
-                _group_action_buttons(include_status=True),
-            )
-        )
     if not _has_group_operator_access(event, user_id):
+        detail = "> 只有当前群主/管理员或 Bot SUPERUSER 可以申请换绑。"
+        if email_verification_required():
+            detail += (
+                "\n> 邮箱模式下验证码只发送到操作者本人已认证的 QQ 邮箱，"
+                "不会发送到群内。"
+            )
         await qgrebind.finish(
             _message(
-                "### ❌ 没有群换绑权限\n\n"
-                "> 只有当前群主/管理员或 Bot SUPERUSER 可以申请换绑。",
+                f"### ❌ 没有群换绑权限\n\n{detail}",
                 _group_action_buttons(include_status=True),
             )
         )
@@ -1363,19 +1346,12 @@ async def qgcode_handler(
                 "> 当前部署仍使用本地声明模式。"
             )
         )
-    if email_verification_required() and not _has_group_owner_access(event, user_id):
-        await qgcode.finish(
-            _message(
-                "### ❌ 只有当前群主可以提交验证码\n\n"
-                "> 这封验证码发送到了群主 QQ 邮箱，管理员不能代替群主完成认证。",
-                _group_action_buttons(include_status=True),
-            )
-        )
     if not _has_group_operator_access(event, user_id):
         await qgcode.finish(
             _message(
                 "### ❌ 没有群邮箱认证权限\n\n"
-                "> 只有当前群主/管理员或 Bot SUPERUSER 可以提交验证码。",
+                "> 只有当前群主/管理员或 Bot SUPERUSER 可以提交验证码。\n"
+                "> 验证码只发送到操作者本人已认证的 QQ 邮箱，其他人不能代填。",
                 _group_action_buttons(include_status=True),
             )
         )
@@ -1405,7 +1381,7 @@ async def qgcode_handler(
     if challenge is None:
         await qgcode.finish(
             _message(
-                "### ❌ 没有待验证的群主邮箱请求\n\n"
+                "### ❌ 没有待验证的群邮箱请求\n\n"
                 "> 请先在本群发送 `qgbind <真实群号>` 发起群绑定。",
                 _group_action_buttons(include_bind=True),
             )
@@ -1418,14 +1394,14 @@ async def qgcode_handler(
     )
     if not attempt.accepted:
         message = {
-            "invalid_code": "验证码不正确，请检查群主 QQ 邮箱后重试。",
+            "invalid_code": "验证码不正确，请检查你的 QQ 邮箱后重试。",
             "max_attempts": "验证码尝试次数已用完，请重新发起群绑定。",
             "expired": "验证码已过期，请重新发起群绑定。",
             "canceled": "验证码请求已失效，请重新发起群绑定。",
         }.get(attempt.reason, "当前验证码请求不可用，请重新发起群绑定。")
         await qgcode.finish(
             _message(
-                f"### ❌ 群主 QQ 邮箱验证失败\n\n> {message}",
+                f"### ❌ 群绑定 QQ 邮箱验证失败\n\n> {message}",
                 _group_email_code_buttons(
                     user_id,
                     include_bind=True,
@@ -1497,7 +1473,7 @@ async def qgcode_handler(
         str(verified.group_name or "当前群").replace(chr(0), " ").split()
     ) or "当前群"
     summary = (
-        "✅ 群主 QQ 邮箱认证完成\n"
+        "✅ 群绑定 QQ 邮箱认证完成\n"
         f"当前群：{group_label}\n"
         "个人与群 verified 映射已同步；其他用户仍需完成个人 verified 绑定。\n"
         "发送 qgstatus 可查看状态与操作按钮。"
